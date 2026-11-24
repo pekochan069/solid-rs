@@ -15,7 +15,9 @@ use crate::{
     *,
 };
 
+mod ahead;
 mod boundary;
+use ahead::AheadState;
 use boundary::{Boundary, BoundaryPlan, PublishGroup};
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
@@ -49,6 +51,7 @@ impl Answer {
     }
 }
 
+#[derive(Clone)]
 enum Outcome {
     Answer(Answer),
     Pending {
@@ -98,6 +101,7 @@ impl Outcome {
     }
 }
 
+#[derive(Clone)]
 struct Snapshot {
     outcome: Outcome,
     version: u64,
@@ -195,6 +199,8 @@ struct Node<P> {
     running: bool,
     applied: Option<Value>,
     effect_error: Option<EffectError>,
+    affects: usize,
+    ahead: Option<Box<AheadState>>,
 }
 
 struct EffectError {
@@ -222,10 +228,105 @@ impl<P> Node<P> {
                 .is_none_or(|old| !candidate.outcome.same(&old.outcome, self.compare))
         })
     }
+
+    fn pending_status(&self) -> bool {
+        self.committed.as_ref().is_some_and(|committed| {
+            self.affects > 0
+                || self.candidate.as_ref().is_some_and(|candidate| {
+                    (matches!(self.role, Role::Source) || candidate.question != committed.question)
+                        && !candidate.outcome.same(&committed.outcome, self.compare)
+                })
+        })
+    }
+}
+
+struct ReadView<'a> {
+    current: Option<&'a Snapshot>,
+    committed: Option<&'a Snapshot>,
+    latest: Option<&'a Snapshot>,
+    pending: Option<bool>,
+}
+
+impl<'a> ReadView<'a> {
+    fn main<P>(node: &'a Node<P>, snapshot: Option<&'a Snapshot>) -> Self {
+        let committed = node.committed.as_ref();
+        let prospective_answer = snapshot.is_some_and(|s| matches!(s.outcome, Outcome::Answer(_)));
+        Self {
+            current: snapshot,
+            committed,
+            latest: snapshot,
+            pending: if prospective_answer {
+                Some(node.affects > 0)
+            } else {
+                committed.map(|s| {
+                    node.affects > 0 || snapshot.is_some_and(|next| next.question != s.question)
+                })
+            },
+        }
+    }
+
+    fn selected(&self, mode: ReadMode) -> Option<&Snapshot> {
+        match mode {
+            ReadMode::Get => self.current,
+            ReadMode::Latest => self
+                .latest
+                .filter(|s| s.outcome.answer().is_some())
+                .or(self.committed)
+                .or(self.latest),
+            ReadMode::Pending => None,
+        }
+    }
+
+    fn observed(&self, mode: ReadMode) -> u64 {
+        match mode {
+            ReadMode::Pending => self
+                .pending
+                .map_or(0, |is_pending| if is_pending { 2 } else { 1 }),
+            _ => self.selected(mode).map_or(0, |snapshot| snapshot.version),
+        }
+    }
+
+    fn read<P>(&self, key: Key, mode: ReadMode) -> Read<Value> {
+        if mode == ReadMode::Pending {
+            return self
+                .pending
+                .map(|pending| Rc::new(pending) as Value)
+                .ok_or_else(|| {
+                    self.latest
+                        .and_then(|snapshot| snapshot.outcome.wait())
+                        .map_or_else(|| Runtime::<P>::pending(key), ReadError::Pending)
+                });
+        }
+        self.selected(mode)
+            .ok_or_else(|| Runtime::<P>::pending(key))?
+            .outcome
+            .read()
+    }
+}
+
+fn record_read(
+    reads: &mut Vec<Dependency>,
+    source: Key,
+    mode: ReadMode,
+    version: u64,
+    observed: u64,
+) {
+    if !reads
+        .iter()
+        .any(|dep| dep.source == source && dep.mode == mode)
+    {
+        reads.push(Dependency {
+            source,
+            version,
+            mode,
+            observed,
+        });
+    }
 }
 
 enum Resource {
     Node(Key),
+    Affect(Key),
     Cleanup(Box<dyn FnOnce()>),
 }
 
@@ -257,6 +358,8 @@ struct Store<P> {
     next_transaction: Transaction,
     next_owner: u64,
     boundaries: BTreeMap<Key, Boundary<P>>,
+    affects: Arena<(Owner, Key)>,
+    affect_changes: Vec<(Key, bool)>,
 }
 
 impl<P> Store<P> {
@@ -272,6 +375,8 @@ impl<P> Store<P> {
             next_transaction: 0,
             next_owner: 0,
             boundaries: BTreeMap::new(),
+            affects: Arena::new(id),
+            affect_changes: Vec::new(),
         }
     }
 
@@ -599,6 +704,11 @@ impl<P> Store<P> {
                             retired.push(Retired::Node(Box::new(node)));
                         }
                     }
+                    Resource::Affect(key) => {
+                        if let Some((_, source)) = self.affects.remove(key) {
+                            self.affect_changes.push((source, false));
+                        }
+                    }
                     Resource::Cleanup(cleanup) => retired.push(Retired::Cleanup(cleanup)),
                 }
             }
@@ -752,31 +862,33 @@ impl<P> FrameReads<'_, P> {
 }
 
 impl<P> ReadGraph for FrameReads<'_, P> {
-    fn read(&mut self, key: Key, ty: TypeId, reads: &mut Vec<Dependency>) -> Read<Value> {
+    fn read(
+        &mut self,
+        key: Key,
+        ty: TypeId,
+        mode: ReadMode,
+        reads: &mut Vec<Dependency>,
+    ) -> Read<Value> {
         if key.runtime != self.id {
             return Err(ReadError::Handle(HandleError::WrongRuntime));
         }
         let node = self.store.nodes.get(key).ok_or(HandleError::Disposed)?;
         assert_eq!(node.ty, ty, "handle has a different type than its node");
         if self.running.contains(&key) {
-            reads.push(Dependency {
-                source: key,
-                version: 0,
-            });
+            record_read(reads, key, mode, 0, 0);
             return Err(ReadError::Failed(Rc::new(Cycle)));
         }
         self.resolve(key)?;
         let snapshot = self.snapshot(key);
-        if !reads.iter().any(|dep| dep.source == key) {
-            reads.push(Dependency {
-                source: key,
-                version: snapshot.map_or(0, |snapshot| snapshot.version),
-            });
-        }
-        snapshot
-            .ok_or_else(|| Runtime::<P>::pending(key))?
-            .outcome
-            .read()
+        let view = ReadView::main(node, snapshot);
+        record_read(
+            reads,
+            key,
+            mode,
+            snapshot.map_or(0, |s| s.version),
+            view.observed(mode),
+        );
+        view.read::<P>(key, mode)
     }
 }
 
@@ -849,6 +961,8 @@ impl<P> Registration<P> {
             running: false,
             applied: None,
             effect_error: None,
+            affects: 0,
+            ahead: None,
         });
         self.store
             .owner_mut(self.owner)
@@ -902,6 +1016,25 @@ impl<P> Register<P> for Registration<P> {
         (read, WriteRef(read))
     }
 
+    fn ahead_memo<T: PartialEq + 'static>(
+        &mut self,
+        compute: impl Fn(&mut AheadCx<'_>) -> Read<Derive<T>> + 'static,
+    ) -> ReadRef<T> {
+        let read = self.register::<T>(
+            Role::Memo,
+            Some(Rc::new(move |cx| {
+                compute(&mut AheadCx {
+                    graph: cx.graph,
+                    reads: cx.reads,
+                })
+                .map(Computed::erase)
+            })),
+            None,
+        );
+        self.store.node_mut(read.0).ahead = Some(Box::default());
+        read
+    }
+
     fn render<T: PartialEq + 'static>(
         &mut self,
         compute: impl Fn(&mut Cx<'_>) -> Read<T> + 'static,
@@ -928,6 +1061,25 @@ impl<P> Register<P> for Registration<P> {
             })),
             None,
         );
+    }
+
+    fn render_ahead<T: PartialEq + 'static>(
+        &mut self,
+        compute: impl Fn(&mut AheadCx<'_>) -> Read<T> + 'static,
+        apply: impl Fn(Rc<T>) -> P + 'static,
+    ) {
+        let read = self.register::<T>(
+            Role::Render(Rc::new(move |value| apply(downcast(value)))),
+            Some(Rc::new(move |cx| {
+                compute(&mut AheadCx {
+                    graph: cx.graph,
+                    reads: cx.reads,
+                })
+                .map(|value| Computed::Value(Rc::new(value)))
+            })),
+            None,
+        );
+        self.store.node_mut(read.0).ahead = Some(Box::default());
     }
 
     fn on_cleanup(&mut self, cleanup: impl FnOnce() + 'static) {
@@ -1122,8 +1274,9 @@ impl<P> Runtime<P> {
                     break;
                 }
                 reads.push(Dependency {
-                    source: dep.source,
                     version,
+                    observed: version,
+                    ..dep
                 });
             }
             new_question = !unchanged;
@@ -1366,6 +1519,15 @@ impl<P> Runtime<P> {
     }
 
     fn promote_inputs(&mut self) {
+        for (key, add) in std::mem::take(&mut self.store.affect_changes) {
+            if let Some(node) = self.store.nodes.get_mut(key) {
+                if add {
+                    node.affects += 1;
+                } else {
+                    node.affects -= 1;
+                }
+            }
+        }
         self.seed_sources();
         let inputs: BTreeMap<_, _> = std::mem::take(&mut self.inputs).into_iter().collect();
         for (key, command) in inputs {
@@ -1427,7 +1589,10 @@ impl<P> Runtime<P> {
         self.transaction = self.store.new_transaction();
         self.promote_inputs();
         self.drain_dirty().map_err(|_| FlushError::Poisoned)?;
-        for id in ready {
+        for &id in ready
+            .iter()
+            .filter(|id| id.domain == EvaluationDomain::Main)
+        {
             let Some(answer) = self.poll_flight(id).and_then(Self::poll_answer) else {
                 continue;
             };
@@ -1454,11 +1619,21 @@ impl<P> Runtime<P> {
             }
         }
 
+        self.publish_ahead(
+            sink,
+            ready
+                .into_iter()
+                .filter(|id| id.domain == EvaluationDomain::Ahead),
+        )?;
+
         let mut projection_holds = HashSet::new();
         loop {
             let (groups, ready) = self.transaction_groups();
             let Some(transaction) = ready.into_iter().find(|id| !projection_holds.contains(id))
             else {
+                if !self.store.affect_changes.is_empty() {
+                    self.request_tick();
+                }
                 return Ok(());
             };
             match self.publish_group(sink, &groups, transaction)? {
@@ -1727,7 +1902,7 @@ impl<P> Runtime<P> {
             match (&node.role, answer) {
                 (Role::Render(apply), Answer::Value(value))
                     if exposed
-                        || node.committed.as_ref().is_none_or(|committed| {
+                        || node.displayed().is_none_or(|committed| {
                             !committed.outcome.same(&snapshot.outcome, node.compare)
                         }) =>
                 {
@@ -1766,6 +1941,7 @@ impl<P> Runtime<P> {
         }
         ops.extend(removed.into_iter().map(FrameOp::Remove));
         let mut replaced = Vec::with_capacity(staged.len() + projected.len());
+        let mut replaced_ahead = Vec::with_capacity(staged.len() + projected.len());
         let mut resume = Vec::with_capacity(staged.len());
         if !ops.is_empty() {
             let sequence = self
@@ -1800,6 +1976,7 @@ impl<P> Runtime<P> {
         });
         for key in staged {
             replaced.push(self.store.commit(key));
+            replaced_ahead.extend(self.adopt_main_ahead(key));
             if let Some(id) = self
                 .store
                 .node_mut(key)
@@ -1812,6 +1989,7 @@ impl<P> Runtime<P> {
         }
         for (key, snapshot) in projected {
             replaced.push(self.store.commit_frame(key, snapshot));
+            replaced_ahead.extend(self.adopt_main_ahead(key));
         }
         for &key in &keys {
             let node = self.store.node_mut(key);
@@ -1850,7 +2028,7 @@ impl<P> Runtime<P> {
         for owner in boundary_removals {
             self.store.remove_tree(owner, &mut retired);
         }
-        drop(replaced);
+        drop((replaced, replaced_ahead));
         clean(retired);
         for id in resume {
             self.mailbox.request_tick(Some(id));
@@ -1894,31 +2072,39 @@ impl<P> Runtime<P> {
                 switch.candidate = None;
             }
             self.store.discard_candidate(key);
+            if let Some(ahead) = &mut self.store.node_mut(key).ahead {
+                ahead.discard();
+            }
         }
         clean(retired);
     }
 }
 
 impl<P> ReadGraph for Runtime<P> {
-    fn read(&mut self, key: Key, ty: TypeId, reads: &mut Vec<Dependency>) -> Read<Value> {
+    fn read(
+        &mut self,
+        key: Key,
+        ty: TypeId,
+        mode: ReadMode,
+        reads: &mut Vec<Dependency>,
+    ) -> Read<Value> {
         let node = self.checked_node(key, ty)?;
         if node.running {
-            reads.push(Dependency {
-                source: key,
-                version: 0,
-            });
+            record_read(reads, key, mode, 0, 0);
             return Err(ReadError::Failed(Rc::new(Cycle)));
         }
         self.evaluate(key)?;
-        let snapshot = self.store.node(key).current();
-        let version = snapshot.map_or(0, |s| s.version);
-        if !reads.iter().any(|read| read.source == key) {
-            reads.push(Dependency {
-                source: key,
-                version,
-            });
-        }
-        snapshot.ok_or_else(|| Self::pending(key))?.outcome.read()
+        let node = self.store.node(key);
+        let snapshot = node.current();
+        let view = ReadView::main(node, snapshot);
+        record_read(
+            reads,
+            key,
+            mode,
+            snapshot.map_or(0, |s| s.version),
+            view.observed(mode),
+        );
+        view.read::<P>(key, mode)
     }
 }
 
@@ -1961,6 +2147,7 @@ impl<P> Drive<P> for Runtime<P> {
             }
             if layout_changed
                 || !runtime.store.dirty.is_empty()
+                || !runtime.store.affect_changes.is_empty()
                 || runtime.store.nodes.keys().any(|key| {
                     runtime
                         .store
@@ -2009,22 +2196,28 @@ impl<P> Drive<P> for Runtime<P> {
 
     fn committed<T: 'static>(&self, source: ReadRef<T>) -> Read<Rc<T>> {
         let node = self.checked_node(source.0, TypeId::of::<T>())?;
-        let snapshot = node
-            .committed
-            .as_ref()
-            .ok_or_else(|| Self::pending(source.0))?;
+        let snapshot = node.displayed().ok_or_else(|| Self::pending(source.0))?;
         snapshot.outcome.read().map(downcast)
     }
 
     fn latest<T: 'static>(&self, source: ReadRef<T>) -> Read<Rc<T>> {
         let node = self.checked_node(source.0, TypeId::of::<T>())?;
+        if let Some(ahead) = &node.ahead {
+            if ahead.has_candidate() {
+                return ahead
+                    .view(node.affects, node.compare)
+                    .read::<P>(source.0, ReadMode::Latest)
+                    .map(downcast);
+            }
+        }
         if let Some(answer) = node
-            .current()
+            .candidate
+            .as_ref()
             .and_then(|snapshot| snapshot.outcome.answer())
         {
             return answer.read().map(downcast);
         }
-        if let Some(snapshot) = node.committed.as_ref() {
+        if let Some(snapshot) = node.displayed() {
             return snapshot.outcome.read().map(downcast);
         }
         node.current()
@@ -2034,10 +2227,60 @@ impl<P> Drive<P> for Runtime<P> {
             .map(downcast)
     }
 
+    fn is_pending<T: 'static>(&self, source: ReadRef<T>) -> Result<bool, HandleError> {
+        let node = self.checked_node(source.0, TypeId::of::<T>())?;
+        Ok(node
+            .ahead
+            .as_ref()
+            .filter(|ahead| ahead.has_candidate())
+            .map_or_else(
+                || node.pending_status(),
+                |ahead| {
+                    ahead
+                        .view(node.affects, node.compare)
+                        .pending
+                        .unwrap_or(false)
+                },
+            ))
+    }
+
     fn refresh<T: 'static>(&mut self, source: ReadRef<T>) -> Result<(), HandleError> {
         let node = self.checked_node(source.0, TypeId::of::<T>())?;
         if node.compute.is_some() {
             self.inputs.push((source.0, Command::Refresh));
+            self.request_tick();
+        }
+        Ok(())
+    }
+
+    fn affects<T: 'static>(
+        &mut self,
+        owner: Owner,
+        source: ReadRef<T>,
+    ) -> Result<Affect, HandleError> {
+        self.check_key(owner.0)?;
+        if self.store.owners.get(owner.0).is_none() {
+            return Err(HandleError::Disposed);
+        }
+        self.checked_node(source.0, TypeId::of::<T>())?;
+        let key = self.store.affects.insert((owner, source.0));
+        self.store
+            .owner_mut(owner)
+            .resources
+            .push(Resource::Affect(key));
+        self.store.affect_changes.push((source.0, true));
+        self.request_tick();
+        Ok(Affect(key, PhantomData))
+    }
+
+    fn end_affect(&mut self, token: Affect) -> Result<(), HandleError> {
+        self.check_key(token.0)?;
+        if let Some((owner, source)) = self.store.affects.remove(token.0) {
+            self.store
+                .owner_mut(owner)
+                .resources
+                .retain(|resource| !matches!(resource, Resource::Affect(key) if *key == token.0));
+            self.store.affect_changes.push((source, false));
             self.request_tick();
         }
         Ok(())

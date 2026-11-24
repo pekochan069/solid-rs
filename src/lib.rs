@@ -42,6 +42,9 @@ impl<T> Clone for WriteRef<T> {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Owner(Key, PhantomData<Rc<()>>);
 
+#[derive(Clone, Copy)]
+pub struct Affect(Key, PhantomData<Rc<()>>);
+
 pub type Failure = Rc<dyn Error>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,10 +101,25 @@ type Value = Rc<dyn Any>;
 struct Dependency {
     source: Key,
     version: u64,
+    mode: ReadMode,
+    observed: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadMode {
+    Get,
+    Latest,
+    Pending,
 }
 
 trait ReadGraph {
-    fn read(&mut self, key: Key, ty: TypeId, reads: &mut Vec<Dependency>) -> Read<Value>;
+    fn read(
+        &mut self,
+        key: Key,
+        ty: TypeId,
+        mode: ReadMode,
+        reads: &mut Vec<Dependency>,
+    ) -> Read<Value>;
 }
 
 pub struct Cx<'a> {
@@ -112,8 +130,33 @@ pub struct Cx<'a> {
 impl Cx<'_> {
     pub fn get<T: 'static>(&mut self, source: ReadRef<T>) -> Read<Rc<T>> {
         self.graph
-            .read(source.0, TypeId::of::<T>(), self.reads)
+            .read(source.0, TypeId::of::<T>(), ReadMode::Get, self.reads)
             .map(downcast)
+    }
+}
+
+pub struct AheadCx<'a> {
+    graph: &'a mut dyn ReadGraph,
+    reads: &'a mut Vec<Dependency>,
+}
+
+impl AheadCx<'_> {
+    pub fn get<T: 'static>(&mut self, source: ReadRef<T>) -> Read<Rc<T>> {
+        self.read(source, ReadMode::Get).map(downcast)
+    }
+
+    pub fn latest<T: 'static>(&mut self, source: ReadRef<T>) -> Read<Rc<T>> {
+        self.read(source, ReadMode::Latest).map(downcast)
+    }
+
+    pub fn is_pending<T: 'static>(&mut self, source: ReadRef<T>) -> Read<bool> {
+        self.read(source, ReadMode::Pending)
+            .map(|value| *downcast::<bool>(value))
+    }
+
+    fn read<T: 'static>(&mut self, source: ReadRef<T>, mode: ReadMode) -> Read<Value> {
+        self.graph
+            .read(source.0, TypeId::of::<T>(), mode, self.reads)
     }
 }
 
@@ -187,9 +230,20 @@ pub trait Register<P>: Sized {
         compute: impl Fn(&mut Cx<'_>) -> Read<Derive<T>> + 'static,
     ) -> (ReadRef<T>, WriteRef<T>);
 
+    fn ahead_memo<T: PartialEq + 'static>(
+        &mut self,
+        compute: impl Fn(&mut AheadCx<'_>) -> Read<Derive<T>> + 'static,
+    ) -> ReadRef<T>;
+
     fn render<T: PartialEq + 'static>(
         &mut self,
         compute: impl Fn(&mut Cx<'_>) -> Read<T> + 'static,
+        apply: impl Fn(Rc<T>) -> P + 'static,
+    );
+
+    fn render_ahead<T: PartialEq + 'static>(
+        &mut self,
+        compute: impl Fn(&mut AheadCx<'_>) -> Read<T> + 'static,
         apply: impl Fn(Rc<T>) -> P + 'static,
     );
 
@@ -239,7 +293,17 @@ pub trait Drive<P> {
 
     fn latest<T: 'static>(&self, source: ReadRef<T>) -> Read<Rc<T>>;
 
+    fn is_pending<T: 'static>(&self, source: ReadRef<T>) -> Result<bool, HandleError>;
+
     fn refresh<T: 'static>(&mut self, source: ReadRef<T>) -> Result<(), HandleError>;
+
+    fn affects<T: 'static>(
+        &mut self,
+        owner: Owner,
+        source: ReadRef<T>,
+    ) -> Result<Affect, HandleError>;
+
+    fn end_affect(&mut self, token: Affect) -> Result<(), HandleError>;
 
     fn flush(&mut self, sink: &mut impl FrameSink<P>) -> Result<(), FlushError>;
 }

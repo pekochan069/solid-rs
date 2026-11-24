@@ -46,6 +46,7 @@ pub(super) enum Work {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum EvaluationDomain {
     Main,
+    Ahead,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
