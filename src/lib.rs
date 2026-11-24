@@ -1,4 +1,5 @@
 mod arena;
+mod async_jobs;
 mod runtime;
 
 use std::{
@@ -207,6 +208,10 @@ pub trait Drive<P> {
         -> Read<()>;
 
     fn committed<T: 'static>(&self, source: ReadRef<T>) -> Read<Rc<T>>;
+
+    fn latest<T: 'static>(&self, source: ReadRef<T>) -> Read<Rc<T>>;
+
+    fn refresh<T: 'static>(&mut self, source: ReadRef<T>) -> Result<(), HandleError>;
 
     fn flush(&mut self, sink: &mut impl FrameSink<P>) -> Result<(), FlushError>;
 }

@@ -3,14 +3,21 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashSet},
     fmt,
     panic::{self, AssertUnwindSafe},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
-use crate::{arena::Arena, *};
+use crate::{
+    arena::Arena,
+    async_jobs::{Computed, EvaluationDomain, Flight, FlightId, Mailbox, Progress, Work},
+    *,
+};
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
-type Compute = Rc<dyn Fn(&mut Cx<'_>) -> Read<Value>>;
+type Compute = Rc<dyn Fn(&mut Cx<'_>) -> Read<Computed>>;
 type Compare = fn(&Value, &Value) -> bool;
 type Render<P> = Rc<dyn Fn(Value) -> P>;
 type ApplyEffect = Box<dyn FnMut(&mut EffectCx<'_>, Value) -> JobResult<()>>;
@@ -38,9 +45,59 @@ impl Answer {
     }
 }
 
+enum Outcome {
+    Answer(Answer),
+    Pending {
+        wait: PendingRead,
+        retained: Option<Answer>,
+    },
+}
+
+impl Outcome {
+    fn answer(&self) -> Option<&Answer> {
+        match self {
+            Self::Answer(answer) => Some(answer),
+            Self::Pending { retained, .. } => retained.as_ref(),
+        }
+    }
+
+    fn wait(&self) -> Option<PendingRead> {
+        match self {
+            Self::Pending {
+                wait,
+                retained: None,
+            } => Some(*wait),
+            _ => None,
+        }
+    }
+
+    fn read(&self) -> Read<Value> {
+        match self {
+            Self::Answer(answer)
+            | Self::Pending {
+                retained: Some(answer),
+                ..
+            } => answer.read(),
+            Self::Pending {
+                wait,
+                retained: None,
+            } => Err(ReadError::Pending(*wait)),
+        }
+    }
+
+    fn same(&self, other: &Self, compare: Compare) -> bool {
+        match (self.answer(), other.answer()) {
+            (Some(left), Some(right)) => left.same(right, compare),
+            (None, None) => self.wait() == other.wait(),
+            _ => false,
+        }
+    }
+}
+
 struct Snapshot {
-    answer: Answer,
+    outcome: Outcome,
     version: u64,
+    question: u64,
     reads: Vec<Dependency>,
 }
 
@@ -51,16 +108,24 @@ enum Role<P> {
     Effect(Option<ApplyEffect>),
 }
 
+enum Command {
+    Set(Value),
+    Refresh,
+}
+
 struct Node<P> {
     owner: Owner,
     ty: TypeId,
     compare: Compare,
     compute: Option<Compute>,
     role: Role<P>,
+    initial: Option<Snapshot>,
     committed: Option<Snapshot>,
     candidate: Option<Snapshot>,
     subscribers: HashSet<Key>,
-    manual: Option<Value>,
+    command: Option<Command>,
+    question: u64,
+    flight: Option<Flight>,
     height: u32,
     queued: Option<u64>,
     running: bool,
@@ -98,6 +163,7 @@ struct Store<P> {
     nodes: Arena<Node<P>>,
     roots: Vec<Owner>,
     attach: Vec<Owner>,
+    new_sources: Vec<Key>,
     dirty: BinaryHeap<Reverse<(u32, u64, Key)>>,
     next_enqueue: u64,
 }
@@ -109,6 +175,7 @@ impl<P> Store<P> {
             nodes: Arena::new(id),
             roots: Vec::new(),
             attach: Vec::new(),
+            new_sources: Vec::new(),
             dirty: BinaryHeap::new(),
             next_enqueue: 0,
         }
@@ -164,13 +231,12 @@ impl<P> Store<P> {
         }
     }
 
-    fn stage(&mut self, key: Key, answer: Answer, reads: Vec<Dependency>) -> bool {
+    fn stage(&mut self, key: Key, outcome: Outcome, reads: Vec<Dependency>) -> bool {
         let node = self.node(key);
         let current = node.current();
         let previous_version = current.map_or(0, |s| s.version);
-        let previous_answer = current.map(|snapshot| snapshot.answer.clone());
-        let compare = node.compare;
-        let changed = previous_answer.is_none_or(|previous| !answer.same(&previous, compare));
+        let question = node.question;
+        let changed = current.is_none_or(|previous| !outcome.same(&previous.outcome, node.compare));
         let version = if changed {
             previous_version
                 .checked_add(1)
@@ -204,8 +270,9 @@ impl<P> Store<P> {
             }
         }
         let previous = self.node_mut(key).candidate.replace(Snapshot {
-            answer,
+            outcome,
             version,
+            question,
             reads,
         });
         drop(previous);
@@ -306,14 +373,18 @@ impl<P> Registration<P> {
             compare: |left, right| left.downcast_ref::<T>() == right.downcast_ref::<T>(),
             compute,
             role,
-            committed: None,
-            candidate: initial.map(|value| Snapshot {
-                answer: Answer::Value(Rc::new(value)),
+            initial: initial.map(|value| Snapshot {
+                outcome: Outcome::Answer(Answer::Value(Rc::new(value))),
                 version: 1,
+                question: 0,
                 reads: Vec::new(),
             }),
+            committed: None,
+            candidate: None,
             subscribers: HashSet::new(),
-            manual: None,
+            command: None,
+            question: 0,
+            flight: None,
             height: 0,
             queued: None,
             running: false,
@@ -322,6 +393,9 @@ impl<P> Registration<P> {
             .owner_mut(self.owner)
             .resources
             .push(Resource::Node(key));
+        if self.store.node(key).initial.is_some() {
+            self.store.new_sources.push(key);
+        }
         self.store.schedule(key);
         ReadRef(key, PhantomData)
     }
@@ -337,17 +411,6 @@ impl fmt::Display for Cycle {
 }
 
 impl Error for Cycle {}
-
-#[derive(Debug)]
-struct AsyncUnavailable;
-
-impl fmt::Display for AsyncUnavailable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("asynchronous computations are unavailable")
-    }
-}
-
-impl Error for AsyncUnavailable {}
 
 impl<P> Register<P> for Registration<P> {
     fn owner(&self) -> Owner {
@@ -365,12 +428,7 @@ impl<P> Register<P> for Registration<P> {
     ) -> ReadRef<T> {
         self.register::<T>(
             Role::Memo,
-            Some(Rc::new(move |cx| match compute(cx)? {
-                Derive::Value(value) => Ok(Rc::new(value)),
-                Derive::Future(_) | Derive::Stream(_) => {
-                    Err(ReadError::Failed(Rc::new(AsyncUnavailable)))
-                }
-            })),
+            Some(Rc::new(move |cx| compute(cx).map(Computed::erase))),
             None,
         )
     }
@@ -390,7 +448,9 @@ impl<P> Register<P> for Registration<P> {
     ) {
         self.register::<T>(
             Role::Render(Rc::new(move |value| apply(downcast(value)))),
-            Some(Rc::new(move |cx| Ok(Rc::new(compute(cx)?)))),
+            Some(Rc::new(move |cx| {
+                Ok(Computed::Value(Rc::new(compute(cx)?)))
+            })),
             None,
         );
     }
@@ -402,7 +462,9 @@ impl<P> Register<P> for Registration<P> {
     ) {
         self.register::<T>(
             Role::Effect(Some(Box::new(move |cx, value| apply(cx, downcast(value))))),
-            Some(Rc::new(move |cx| Ok(Rc::new(compute(cx)?)))),
+            Some(Rc::new(move |cx| {
+                Ok(Computed::Value(Rc::new(compute(cx)?)))
+            })),
             None,
         );
     }
@@ -418,9 +480,9 @@ impl<P> Register<P> for Registration<P> {
 pub struct Runtime<P> {
     id: u64,
     store: Store<P>,
-    writes: Vec<(Key, Value)>,
-    wake_host: Box<dyn Fn() + Send + Sync>,
-    wake_posted: bool,
+    inputs: Vec<(Key, Command)>,
+    mailbox: Arc<Mailbox>,
+    next_flight: u64,
     busy: bool,
     poisoned: bool,
     sequence: u64,
@@ -445,9 +507,9 @@ impl<P> Runtime<P> {
         Ok(Self {
             id,
             store: Store::new(id),
-            writes: Vec::new(),
-            wake_host: Box::new(wake_host),
-            wake_posted: false,
+            inputs: Vec::new(),
+            mailbox: Mailbox::new(wake_host),
+            next_flight: 0,
             busy: false,
             poisoned: false,
             sequence: 0,
@@ -461,16 +523,14 @@ impl<P> Runtime<P> {
             Err(payload) => {
                 self.poisoned = true;
                 self.busy = false;
+                self.mailbox.close();
                 panic::resume_unwind(payload);
             }
         }
     }
 
     fn request_tick(&mut self) {
-        if !self.wake_posted {
-            self.wake_posted = true;
-            self.guarded(|runtime| (runtime.wake_host)());
-        }
+        self.guarded(|runtime| runtime.mailbox.request_tick(None));
     }
 
     fn check_key(&self, key: Key) -> Result<(), HandleError> {
@@ -492,7 +552,7 @@ impl<P> Runtime<P> {
 
     fn pending(key: Key) -> ReadError {
         ReadError::Pending(PendingRead {
-            attempt: key.generation,
+            attempt: 0,
             wait: u64::from(key.index),
         })
     }
@@ -507,8 +567,15 @@ impl<P> Runtime<P> {
         };
         node.running = true;
         let previous = node.current().map(|snapshot| snapshot.reads.clone());
-        let manual = node.manual.take();
+        let had_snapshot = previous.is_some();
+        let command = node.command.take();
+        let forced = command.is_some();
+        let manual = match command {
+            Some(Command::Set(value)) => Some(value),
+            _ => None,
+        };
         let mut reads = Vec::new();
+        let mut new_question = previous.is_none();
         if let Some(previous) = previous {
             let mut unchanged = true;
             for dep in previous {
@@ -532,39 +599,68 @@ impl<P> Runtime<P> {
                     version,
                 });
             }
-            if let Some(value) = manual {
-                self.finish_evaluation(key, Answer::Value(value), reads);
-                return Ok(());
-            }
-            if unchanged {
+            new_question = !unchanged;
+            if unchanged && !forced {
                 self.store.node_mut(key).running = false;
                 return Ok(());
             }
-            reads.clear();
+            if manual.is_none() {
+                reads.clear();
+            }
+        }
+        let node = self.store.node_mut(key);
+        if new_question {
+            node.question = node
+                .question
+                .checked_add(1)
+                .expect("question revision exhausted");
+        }
+        let retired = node.flight.take();
+        drop(retired);
+        if let Some(value) = manual.as_ref().filter(|_| had_snapshot) {
+            self.finish_evaluation(key, Outcome::Answer(Answer::Value(Rc::clone(value))), reads);
+            return Ok(());
         }
         let result = compute(&mut Cx {
             graph: self,
             reads: &mut reads,
         });
-        let answer = match (result, manual) {
+        let outcome = match (result, manual) {
             (Err(ReadError::Handle(error)), _) => {
                 self.poisoned = true;
                 return Err(error);
             }
-            (_, Some(value)) | (Ok(value), _) => Answer::Value(value),
-            (Err(ReadError::Failed(error)), _) => Answer::Failed(error),
-            (Err(ReadError::Pending(_)), _) => {
-                unreachable!("synchronous computation returned pending")
+            (_, Some(value)) | (Ok(Computed::Value(value)), _) => {
+                Outcome::Answer(Answer::Value(value))
+            }
+            (Err(ReadError::Failed(error)), _) => Outcome::Answer(Answer::Failed(error)),
+            (Ok(Computed::Job(work)), _) => self.start_flight(key, work),
+            (Err(ReadError::Pending(wait)), _) => {
+                if !reads.iter().any(|dep| {
+                    self.store
+                        .nodes
+                        .get(dep.source)
+                        .and_then(Node::current)
+                        .is_some_and(|snapshot| {
+                            snapshot.version == dep.version && snapshot.outcome.wait() == Some(wait)
+                        })
+                }) {
+                    return Err(HandleError::Poisoned);
+                }
+                Outcome::Pending {
+                    wait,
+                    retained: None,
+                }
             }
         };
         if self.poisoned {
             return Err(HandleError::Poisoned);
         }
-        self.finish_evaluation(key, answer, reads);
+        self.finish_evaluation(key, outcome, reads);
         Ok(())
     }
 
-    fn finish_evaluation(&mut self, key: Key, answer: Answer, reads: Vec<Dependency>) {
+    fn finish_evaluation(&mut self, key: Key, outcome: Outcome, reads: Vec<Dependency>) -> bool {
         let height = reads
             .iter()
             .filter(|dep| dep.version != 0)
@@ -575,24 +671,94 @@ impl<P> Runtime<P> {
         let node = self.store.node_mut(key);
         node.height = node.height.max(height);
         node.running = false;
-        self.store.stage(key, answer, reads);
+        self.store.stage(key, outcome, reads)
     }
 
-    fn advance(&mut self) -> Result<(), HandleError> {
-        let writes: BTreeMap<_, _> = std::mem::take(&mut self.writes).into_iter().collect();
-        for (key, value) in writes {
+    fn start_flight(&mut self, key: Key, work: Work) -> Outcome {
+        self.next_flight = self
+            .next_flight
+            .checked_add(1)
+            .expect("flight generation exhausted");
+        let node = self.store.node_mut(key);
+        let id = FlightId {
+            node: key,
+            domain: EvaluationDomain::Main,
+            question: node.question,
+            generation: self.next_flight,
+        };
+        node.flight = Some(Flight::new(id, work));
+        let progress = self.poll_flight(id).expect("new flight is ready to poll");
+        if let Some(answer) = Self::poll_answer(progress) {
+            return Outcome::Answer(answer);
+        }
+        let retained = self
+            .store
+            .node(key)
+            .current()
+            .filter(|snapshot| snapshot.question == id.question)
+            .and_then(|snapshot| snapshot.outcome.answer())
+            .cloned();
+        Outcome::Pending {
+            wait: PendingRead {
+                attempt: self.id,
+                wait: id.generation,
+            },
+            retained,
+        }
+    }
+
+    fn poll_flight(&mut self, id: FlightId) -> Option<Progress> {
+        let node = self.store.nodes.get_mut(id.node)?;
+        let flight = node.flight.as_ref()?;
+        if flight.id != id || id.question != node.question || !flight.can_poll() {
+            return None;
+        }
+        let mut flight = node.flight.take().expect("validated flight");
+        let waker = self.mailbox.waker(id);
+        let progress = flight.poll(&mut Context::from_waker(&waker));
+        if !matches!(progress, Progress::Done(_)) {
+            self.store.node_mut(id.node).flight = Some(flight);
+        }
+        Some(progress)
+    }
+
+    fn poll_answer(progress: Progress) -> Option<Answer> {
+        match progress {
+            Progress::Item(value) | Progress::Done(Some(Ok(value))) => Some(Answer::Value(value)),
+            Progress::Done(Some(Err(error))) => Some(Answer::Failed(error)),
+            Progress::Pending | Progress::Done(None) => None,
+        }
+    }
+
+    fn promote_inputs(&mut self) {
+        for key in std::mem::take(&mut self.store.new_sources) {
+            if let Some(node) = self.store.nodes.get_mut(key) {
+                node.candidate = node.initial.take();
+            }
+        }
+        let inputs: BTreeMap<_, _> = std::mem::take(&mut self.inputs).into_iter().collect();
+        for (key, command) in inputs {
             if let Some(node) = self.store.nodes.get_mut(key) {
                 if matches!(node.role, Role::Source) {
-                    if self.store.stage(key, Answer::Value(value), Vec::new()) {
+                    let Command::Set(value) = command else {
+                        unreachable!("source refresh is a no-op")
+                    };
+                    if self
+                        .store
+                        .stage(key, Outcome::Answer(Answer::Value(value)), Vec::new())
+                    {
                         self.store.invalidate_subscribers(key);
                     }
                 } else {
-                    node.manual = Some(value);
+                    node.command = Some(command);
                     self.store.schedule(key);
                     self.store.invalidate_subscribers(key);
                 }
             }
         }
+    }
+
+    fn drain_dirty(&mut self) -> Result<(), HandleError> {
         while let Some(Reverse((_, revision, key))) = self.store.dirty.pop() {
             if self
                 .store
@@ -607,8 +773,25 @@ impl<P> Runtime<P> {
     }
 
     fn flush_tick(&mut self, sink: &mut impl FrameSink<P>) -> Result<(), FlushError> {
-        self.wake_posted = false;
-        self.advance().map_err(|_| FlushError::Poisoned)?;
+        let ready = self.mailbox.drain();
+        self.promote_inputs();
+        self.drain_dirty().map_err(|_| FlushError::Poisoned)?;
+        for id in ready {
+            let Some(answer) = self.poll_flight(id).and_then(Self::poll_answer) else {
+                continue;
+            };
+            let reads = self
+                .store
+                .node(id.node)
+                .current()
+                .expect("live flight snapshot")
+                .reads
+                .clone();
+            if self.store.stage(id.node, Outcome::Answer(answer), reads) {
+                self.store.invalidate_subscribers(id.node);
+                self.drain_dirty().map_err(|_| FlushError::Poisoned)?;
+            }
+        }
 
         let mut ops = Vec::new();
         for &owner in &self.store.attach {
@@ -627,9 +810,12 @@ impl<P> Runtime<P> {
             let Some(candidate) = &node.candidate else {
                 continue;
             };
+            let Outcome::Answer(answer) = &candidate.outcome else {
+                continue;
+            };
             staged.push(key);
             if node.changed() {
-                match (&node.role, &candidate.answer) {
+                match (&node.role, answer) {
                     (Role::Render(apply), Answer::Value(value)) => {
                         let owner = node.owner;
                         let apply = Rc::clone(apply);
@@ -662,10 +848,23 @@ impl<P> Runtime<P> {
         }
 
         self.store.attach.clear();
+        let mut resume = Vec::new();
         for key in staged {
             retired.push(self.store.commit(key));
+            if let Some(id) = self
+                .store
+                .node_mut(key)
+                .flight
+                .as_mut()
+                .and_then(Flight::resume_after_commit)
+            {
+                resume.push(id);
+            }
         }
         drop(retired);
+        for id in resume {
+            self.mailbox.request_tick(Some(id));
+        }
         for (key, value) in effects {
             let Role::Effect(apply) = &mut self.store.node_mut(key).role else {
                 unreachable!()
@@ -698,14 +897,14 @@ impl<P> ReadGraph for Runtime<P> {
                 version,
             });
         }
-        snapshot.ok_or_else(|| Self::pending(key))?.answer.read()
+        snapshot.ok_or_else(|| Self::pending(key))?.outcome.read()
     }
 }
 
 impl<P> WriteQueue for Runtime<P> {
     fn enqueue(&mut self, key: Key, ty: TypeId, value: Value) -> Result<(), HandleError> {
         self.checked_node(key, ty)?;
-        self.writes.push((key, value));
+        self.inputs.push((key, Command::Set(value)));
         self.request_tick();
         Ok(())
     }
@@ -764,15 +963,19 @@ impl<P> Drive<P> for Runtime<P> {
     ) -> Read<()> {
         let key = target.0 .0;
         let node = self.checked_node(key, TypeId::of::<T>())?;
-        let value = if let Some((_, queued)) =
-            self.writes.iter().rev().find(|(queued, _)| *queued == key)
+        let value = if let Some((_, Command::Set(value))) =
+            self.inputs.iter().rev().find(|(queued, _)| *queued == key)
         {
-            Rc::clone(queued)
+            Rc::clone(value)
         } else {
-            node.current()
-                .ok_or_else(|| Self::pending(key))?
-                .answer
-                .read()?
+            let snapshot = node
+                .current()
+                .or(node.initial.as_ref())
+                .ok_or_else(|| Self::pending(key))?;
+            match &snapshot.outcome {
+                Outcome::Answer(answer) => answer.read()?,
+                Outcome::Pending { wait, .. } => return Err(ReadError::Pending(*wait)),
+            }
         };
         let value = downcast::<T>(value);
         let new = self.guarded(|_| update(&value));
@@ -786,7 +989,34 @@ impl<P> Drive<P> for Runtime<P> {
             .committed
             .as_ref()
             .ok_or_else(|| Self::pending(source.0))?;
-        snapshot.answer.read().map(downcast)
+        snapshot.outcome.read().map(downcast)
+    }
+
+    fn latest<T: 'static>(&self, source: ReadRef<T>) -> Read<Rc<T>> {
+        let node = self.checked_node(source.0, TypeId::of::<T>())?;
+        if let Some(answer) = node
+            .current()
+            .and_then(|snapshot| snapshot.outcome.answer())
+        {
+            return answer.read().map(downcast);
+        }
+        if let Some(snapshot) = node.committed.as_ref() {
+            return snapshot.outcome.read().map(downcast);
+        }
+        node.current()
+            .ok_or_else(|| Self::pending(source.0))?
+            .outcome
+            .read()
+            .map(downcast)
+    }
+
+    fn refresh<T: 'static>(&mut self, source: ReadRef<T>) -> Result<(), HandleError> {
+        let node = self.checked_node(source.0, TypeId::of::<T>())?;
+        if node.compute.is_some() {
+            self.inputs.push((source.0, Command::Refresh));
+            self.request_tick();
+        }
+        Ok(())
     }
 
     fn flush(&mut self, sink: &mut impl FrameSink<P>) -> Result<(), FlushError> {
@@ -801,6 +1031,7 @@ impl<P> Drive<P> for Runtime<P> {
         self.busy = false;
         if result.is_err() {
             self.poisoned = true;
+            self.mailbox.close();
         }
         result
     }
@@ -808,6 +1039,7 @@ impl<P> Drive<P> for Runtime<P> {
 
 impl<P> Drop for Runtime<P> {
     fn drop(&mut self) {
+        self.mailbox.close();
         let mut retired = Vec::new();
         while let Some(owner) = self.store.roots.pop() {
             self.store.remove_tree(owner, &mut retired);
