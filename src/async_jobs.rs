@@ -47,6 +47,7 @@ pub(super) enum Work {
 pub(super) enum EvaluationDomain {
     Main,
     Ahead,
+    Frame,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -76,6 +77,22 @@ pub(super) enum Progress {
 }
 
 impl Flight {
+    pub(super) fn poll_slot(
+        slot: &mut Option<Self>,
+        id: FlightId,
+        mailbox: &Arc<Mailbox>,
+    ) -> Option<Progress> {
+        let flight = slot.as_mut()?;
+        if flight.id != id || !flight.can_poll() {
+            return None;
+        }
+        let progress = flight.poll(&mut Context::from_waker(&mailbox.waker(id)));
+        if matches!(progress, Progress::Done(_)) {
+            *slot = None;
+        }
+        Some(progress)
+    }
+
     pub(super) fn new(id: FlightId, work: Work) -> Self {
         Self {
             id,

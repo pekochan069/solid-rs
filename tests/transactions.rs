@@ -552,3 +552,510 @@ fn ready_transactions_publish_in_order_and_only_successful_effects_apply() {
     assert_eq!(sink.0.patches(), vec![vec!["first"]]);
     assert_eq!(*effects.borrow(), vec!["first"]);
 }
+
+struct VisibleBranch {
+    runtime: Runtime<String>,
+    sink: Recorder,
+    route: signals::ReadRef<i32>,
+    label: signals::ReadRef<i32>,
+    rename: signals::WriteRef<i32>,
+    replacement: Rc<RefCell<Job>>,
+}
+
+impl VisibleBranch {
+    fn waiting(
+        build: impl Fn(&mut signals::Registration<String>, signals::ReadRef<i32>, signals::ReadRef<i32>)
+            + 'static,
+    ) -> Self {
+        let mut runtime = Runtime::new(|| {}).unwrap();
+        let replacement = Rc::new(RefCell::new(Job::default()));
+        let mut handles = None;
+        runtime
+            .install(|root| {
+                let (route, navigate) = root.signal(0);
+                let (label, rename) = root.signal(0);
+                handles = Some((route, navigate, label, rename));
+                let replacement = Rc::clone(&replacement);
+                root.switch(
+                    move |cx| Ok(*cx.get(route)?),
+                    move |branch, key| {
+                        if *key == 0 {
+                            build(branch, route, label);
+                        } else {
+                            let replacement = Rc::clone(&replacement);
+                            let result = branch.memo(move |_| {
+                                Ok(Derive::Future(Box::pin(Manual(Rc::clone(&replacement)))))
+                            });
+                            branch.render(move |cx| Ok(*cx.get(result)?), |v| format!("B {v}"));
+                        }
+                    },
+                );
+            })
+            .unwrap();
+        let mut sink = Recorder::default();
+        runtime.flush(&mut sink).unwrap();
+        let (route, navigate, label, rename) = handles.unwrap();
+        runtime.set(navigate, 1).unwrap();
+        runtime.flush(&mut sink).unwrap();
+        assert_eq!(sink.0.len(), 1);
+        Self {
+            runtime,
+            sink,
+            route,
+            label,
+            rename,
+            replacement,
+        }
+    }
+
+    fn rename(&mut self, label: i32) {
+        self.runtime.set(self.rename, label).unwrap();
+        self.runtime.flush(&mut self.sink).unwrap();
+    }
+}
+
+#[test]
+fn projected_failure_builds_one_fallback_with_the_accepted_error() {
+    let attempts = Rc::new(Cell::new(0));
+    let builds = Rc::new(Cell::new(0));
+    let mut view = VisibleBranch::waiting({
+        let attempts = attempts.clone();
+        let builds = builds.clone();
+        move |branch, route, label| {
+            let attempts = attempts.clone();
+            let builds = builds.clone();
+            branch.errored(
+                move |content| {
+                    let attempts = attempts.clone();
+                    content.render(
+                        move |cx| {
+                            let pair = (*cx.get(route)?, *cx.get(label)?);
+                            if pair == (0, 1) {
+                                attempts.set(attempts.get() + 1);
+                                assert!(
+                                    attempts.get() <= 8,
+                                    "projected failure repeatedly evaluated"
+                                );
+                                return Err(signals::ReadError::Failed(Rc::new(io::Error::other(
+                                    "visible error",
+                                ))));
+                            }
+                            Ok(pair)
+                        },
+                        |v| format!("A {v:?}"),
+                    );
+                },
+                move |fallback, error| {
+                    builds.set(builds.get() + 1);
+                    fallback.render(
+                        move |cx| Ok(cx.get(error)?.to_string()),
+                        |text| text.to_string(),
+                    );
+                },
+            );
+        }
+    });
+    view.rename(1);
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(builds.get(), 1);
+    assert_eq!(*view.runtime.committed(view.route).unwrap(), 0);
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 1);
+    assert_eq!(
+        view.sink.patches(),
+        vec![vec!["A (0, 0)"], vec!["visible error"]]
+    );
+    Job::complete(&view.replacement, 5);
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(view.sink.patches()[2], vec!["B 5"]);
+}
+
+#[test]
+fn projected_future_validates_its_inputs_before_polling_a_worker_wake() {
+    let jobs = [
+        Rc::new(RefCell::new(Job::default())),
+        Rc::new(RefCell::new(Job::default())),
+    ];
+    let mut view = VisibleBranch::waiting({
+        let jobs = jobs.clone();
+        move |branch, route, label| {
+            let jobs = jobs.clone();
+            let result = branch.memo(move |cx| {
+                let (route, label) = (*cx.get(route)?, *cx.get(label)?);
+                Ok(if route == 0 && label > 0 {
+                    Derive::Future(Box::pin(Manual(Rc::clone(&jobs[label as usize - 1]))))
+                } else {
+                    Derive::Value(10 + route)
+                })
+            });
+            branch.render(move |cx| Ok(*cx.get(result)?), |v| format!("A {v}"));
+        }
+    });
+    view.rename(1);
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 0);
+    let stale = jobs[0]
+        .borrow()
+        .waker
+        .clone()
+        .expect("first projection must poll");
+    std::thread::spawn(move || stale.wake()).join().unwrap();
+    jobs[0].borrow_mut().value = Some(111);
+    view.rename(2);
+    assert_eq!(jobs[0].borrow().value, Some(111));
+    assert_eq!(jobs[0].borrow().drops, 1);
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 0);
+    assert_eq!(view.sink.patches(), vec![vec!["A 10"]]);
+    let current = jobs[1]
+        .borrow()
+        .waker
+        .clone()
+        .expect("replacement must poll");
+    jobs[1].borrow_mut().value = Some(222);
+    std::thread::spawn(move || current.wake()).join().unwrap();
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 2);
+    assert_eq!(*view.runtime.committed(view.route).unwrap(), 0);
+    assert_eq!(view.sink.patches(), vec![vec!["A 10"], vec!["A 222"]]);
+    Job::complete(&view.replacement, 7);
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(view.sink.patches()[2], vec!["B 7"]);
+}
+
+#[test]
+fn projected_nested_switch_attaches_the_selected_tab_with_its_committed_route() {
+    let mut view = VisibleBranch::waiting(|branch, route, label| {
+        branch.switch(
+            move |cx| {
+                Ok(if *cx.get(route)? == 0 {
+                    *cx.get(label)?
+                } else {
+                    0
+                })
+            },
+            move |tab, key| {
+                let key = *key;
+                tab.render(
+                    move |cx| Ok(*cx.get(route)?),
+                    move |route| format!("A{key} route {route}"),
+                );
+            },
+        );
+    });
+    view.rename(1);
+    assert_eq!(*view.runtime.committed(view.route).unwrap(), 0);
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 1);
+    assert_eq!(
+        view.sink.patches(),
+        vec![vec!["A0 route 0"], vec!["A1 route 0"]]
+    );
+    let replaced = view.sink.0[0]
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            FrameOp::Patch(owner, _) => Some(*owner),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        matches!(&view.sink.0[1].ops[..], [FrameOp::Attach { owner, .. }, FrameOp::Patch(patched, _), FrameOp::SetVisible(visible,true), FrameOp::Remove(old)] if owner == patched && owner == visible && *old == replaced)
+    );
+    Job::complete(&view.replacement, 3);
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(view.sink.patches()[2], vec!["B 3"]);
+}
+
+#[test]
+fn projected_answer_can_publish_while_the_same_memos_main_question_waits() {
+    let main = Rc::new(RefCell::new(Job::default()));
+    let frame = Rc::new(RefCell::new(Job::default()));
+    let mut view = VisibleBranch::waiting({
+        let (main, frame) = (main.clone(), frame.clone());
+        move |branch, route, label| {
+            let (main, frame) = (main.clone(), frame.clone());
+            let result = branch.memo(move |cx| {
+                let pair = (*cx.get(route)?, *cx.get(label)?);
+                Ok(match pair {
+                    (_, 0) => Derive::Value(0),
+                    (0, _) => Derive::Future(Box::pin(Manual(frame.clone()))),
+                    _ => Derive::Future(Box::pin(Manual(main.clone()))),
+                })
+            });
+            branch.render(move |cx| Ok(*cx.get(result)?), |v| format!("A {v}"));
+        }
+    });
+    view.rename(1);
+    assert!(
+        frame.borrow().waker.is_some(),
+        "visible A must start its own job"
+    );
+    assert!(main.borrow().waker.is_some());
+    Job::complete(&frame, 11);
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 1);
+    assert_eq!(view.sink.patches(), vec![vec!["A 0"], vec!["A 11"]]);
+    Job::complete(&main, 99);
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(view.sink.0.len(), 2);
+}
+
+#[test]
+fn projected_stream_resumes_each_accepted_item_and_retires_with_its_owner() {
+    struct Items {
+        polls: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+    }
+    impl Stream for Items {
+        type Item = JobResult<i32>;
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let count = self.polls.get() + 1;
+            self.polls.set(count);
+            Poll::Ready(Some(Ok(count as i32)))
+        }
+    }
+    impl Drop for Items {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+    let (polls, drops) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let mut view = VisibleBranch::waiting({
+        let (polls, drops) = (polls.clone(), drops.clone());
+        move |branch, route, label| {
+            let (polls, drops) = (polls.clone(), drops.clone());
+            let result = branch.memo(move |cx| {
+                let pair = (*cx.get(route)?, *cx.get(label)?);
+                Ok(if pair == (0, 1) {
+                    Derive::Stream(Box::pin(Items {
+                        polls: polls.clone(),
+                        drops: drops.clone(),
+                    }))
+                } else {
+                    Derive::Value(0)
+                })
+            });
+            branch.render(move |cx| Ok(*cx.get(result)?), |v| format!("A {v}"));
+        }
+    });
+    view.rename(1);
+    assert_eq!(polls.get(), 1);
+    assert_eq!(view.sink.patches()[1], vec!["A 1"]);
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(view.sink.patches()[2], vec!["A 2"]);
+    Job::complete(&view.replacement, 50);
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(polls.get(), 2);
+    assert_eq!(drops.get(), 1);
+    assert_eq!(view.sink.patches()[3], vec!["B 50"]);
+}
+
+#[test]
+fn disposing_a_visible_branch_drops_its_pending_projected_job_immediately() {
+    let job = Rc::new(RefCell::new(Job::default()));
+    let owner = Rc::new(Cell::new(None));
+    let mut view = VisibleBranch::waiting({
+        let (job, owner) = (job.clone(), owner.clone());
+        move |branch, route, label| {
+            owner.set(Some(branch.owner()));
+            let job = job.clone();
+            let result = branch.memo(move |cx| {
+                Ok(if (*cx.get(route)?, *cx.get(label)?) == (0, 1) {
+                    Derive::Future(Box::pin(Manual(job.clone())))
+                } else {
+                    Derive::Value(0)
+                })
+            });
+            branch.render(move |cx| Ok(*cx.get(result)?), |v| v.to_string());
+        }
+    });
+    view.rename(1);
+    let wake = job.borrow().waker.clone().unwrap();
+    view.runtime.dispose(owner.get().unwrap()).unwrap();
+    assert_eq!(job.borrow().drops, 1);
+    wake.wake();
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 1);
+}
+
+#[test]
+fn projected_future_survives_the_commit_of_its_loading_fallback() {
+    let job = Rc::new(RefCell::new(Job::default()));
+    let attempts = Rc::new(Cell::new(0));
+    let mut view = VisibleBranch::waiting({
+        let job = job.clone();
+        let attempts = attempts.clone();
+        move |branch, route, label| {
+            let job = job.clone();
+            let attempts = attempts.clone();
+            let result = branch.memo(move |cx| {
+                Ok(if (*cx.get(route)?, *cx.get(label)?) == (0, 1) {
+                    attempts.set(attempts.get() + 1);
+                    Derive::Future(Box::pin(Manual(job.clone())))
+                } else {
+                    Derive::Value(0)
+                })
+            });
+            branch.loading(
+                move |cx| {
+                    cx.get(label)?;
+                    Ok(())
+                },
+                move |content| {
+                    content.render(move |cx| Ok(*cx.get(result)?), |value| format!("A {value}"));
+                },
+                |fallback| {
+                    fallback.render(|_| Ok(()), |_| String::from("waiting"));
+                },
+            );
+        }
+    });
+    view.rename(1);
+    assert_eq!(view.sink.patches()[1], vec!["waiting"]);
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 1);
+    Job::complete(&job, 55);
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(view.sink.patches()[2], vec!["A 55"]);
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(*view.runtime.committed(view.route).unwrap(), 0);
+}
+
+#[test]
+fn projected_stream_is_dropped_when_an_independent_write_replaces_its_question() {
+    struct Waiting {
+        job: Rc<RefCell<Job>>,
+        first: bool,
+    }
+    impl Stream for Waiting {
+        type Item = JobResult<i32>;
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if self.first {
+                self.first = false;
+                Poll::Ready(Some(Ok(31)))
+            } else {
+                self.job.borrow_mut().waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            self.job.borrow_mut().drops += 1;
+        }
+    }
+    let job = Rc::new(RefCell::new(Job::default()));
+    let mut view = VisibleBranch::waiting({
+        let job = job.clone();
+        move |branch, route, label| {
+            let job = job.clone();
+            let result = branch.memo(move |cx| {
+                Ok(match (*cx.get(route)?, *cx.get(label)?) {
+                    (0, 1) => Derive::Stream(Box::pin(Waiting {
+                        job: job.clone(),
+                        first: true,
+                    })),
+                    (_, label) => Derive::Value(label),
+                })
+            });
+            branch.render(move |cx| Ok(*cx.get(result)?), |v| format!("A {v}"));
+        }
+    });
+    view.rename(1);
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert!(job.borrow().waker.is_some());
+    view.rename(2);
+    assert_eq!(job.borrow().drops, 1);
+    assert_eq!(view.sink.patches()[2], vec!["A 2"]);
+}
+
+#[test]
+fn superseding_a_pending_projected_tab_retires_the_unpublished_owner() {
+    let job = Rc::new(RefCell::new(Job::default()));
+    let retired = Rc::new(Cell::new(false));
+    let mut view = VisibleBranch::waiting({
+        let (job, retired) = (job.clone(), retired.clone());
+        move |branch, route, label| {
+            let (job, retired) = (job.clone(), retired.clone());
+            branch.switch(
+                move |cx| {
+                    Ok(if *cx.get(route)? == 0 {
+                        *cx.get(label)?
+                    } else {
+                        0
+                    })
+                },
+                move |tab, key| {
+                    let key = *key;
+                    if key == 1 {
+                        let (job, retired) = (job.clone(), retired.clone());
+                        tab.on_cleanup(move || retired.set(true));
+                        let pending =
+                            tab.memo(move |_| Ok(Derive::Future(Box::pin(Manual(job.clone())))));
+                        tab.render(
+                            move |cx| Ok(*cx.get(pending)?),
+                            |v| format!("unpublished {v}"),
+                        );
+                    } else {
+                        tab.render(move |_| Ok(key), |v| format!("tab {v}"));
+                    }
+                },
+            );
+        }
+    });
+    view.rename(1);
+    assert_eq!(view.sink.patches(), vec![vec!["tab 0"]]);
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 0);
+    let stale = job.borrow().waker.clone().unwrap();
+    view.rename(2);
+    assert!(retired.get());
+    assert_eq!(job.borrow().drops, 1);
+    stale.wake();
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(view.sink.patches(), vec![vec!["tab 0"], vec!["tab 2"]]);
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 2);
+    assert_eq!(*view.runtime.committed(view.route).unwrap(), 0);
+}
+
+#[test]
+fn loading_in_a_projected_tab_recovers_its_first_content_after_attach() {
+    let job = Rc::new(RefCell::new(Job::default()));
+    let mut view = VisibleBranch::waiting({
+        let job = job.clone();
+        move |branch, route, label| {
+            let job = job.clone();
+            branch.switch(
+                move |cx| {
+                    Ok(if *cx.get(route)? == 0 {
+                        *cx.get(label)?
+                    } else {
+                        0
+                    })
+                },
+                move |tab, key| {
+                    if *key == 0 {
+                        tab.render(|_| Ok(()), |_| String::from("tab 0"));
+                        return;
+                    }
+                    let job = job.clone();
+                    let pending =
+                        tab.memo(move |_| Ok(Derive::Future(Box::pin(Manual(job.clone())))));
+                    tab.loading(
+                        |_| Ok(()),
+                        move |content| {
+                            content.render(
+                                move |cx| Ok(*cx.get(pending)?),
+                                |v| format!("content {v}"),
+                            );
+                        },
+                        |fallback| {
+                            fallback.render(|_| Ok(()), |_| String::from("waiting"));
+                        },
+                    );
+                },
+            );
+        }
+    });
+    view.rename(1);
+    assert_eq!(view.sink.patches()[1], vec!["waiting"]);
+    assert_eq!(*view.runtime.committed(view.label).unwrap(), 1);
+    Job::complete(&job, 40);
+    view.runtime.flush(&mut view.sink).unwrap();
+    assert_eq!(view.sink.patches().last().unwrap(), &vec!["content 40"]);
+}
