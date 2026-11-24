@@ -150,8 +150,13 @@ fn a_transitive_write_preempts_a_queued_wake_without_an_extra_poll() {
 }
 
 #[test]
-fn a_self_wake_is_carried_into_the_next_tick() {
-    let mut runtime = Runtime::<()>::new(|| {}).unwrap();
+fn a_worker_wake_during_poll_posts_the_next_tick() {
+    let posts = Arc::new(AtomicUsize::new(0));
+    let host = Arc::clone(&posts);
+    let mut runtime = Runtime::<()>::new(move || {
+        host.fetch_add(1, Ordering::SeqCst);
+    })
+    .unwrap();
     let polls = Rc::new(Cell::new(0));
     let mut handle = None;
     runtime
@@ -174,7 +179,9 @@ fn a_self_wake_is_carried_into_the_next_tick() {
         })
         .unwrap();
     let handle = handle.unwrap();
+    let before = posts.load(Ordering::SeqCst);
     runtime.flush(&mut Sink).unwrap();
+    assert_eq!(posts.load(Ordering::SeqCst), before + 1);
     assert_eq!(polls.get(), 1);
     assert!(matches!(
         runtime.committed(handle),

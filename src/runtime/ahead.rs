@@ -5,6 +5,7 @@ pub(super) struct AheadState {
     // These snapshots belong to the displayed lane, independently of the main graph.
     committed: Option<Snapshot>,
     candidate: Option<Snapshot>,
+    candidate_changed: bool,
     flight: Option<Flight>,
     question: u64,
 }
@@ -14,22 +15,25 @@ impl AheadState {
         self.candidate.is_some()
     }
 
+    fn recovering(&self) -> bool {
+        self.committed
+            .as_ref()
+            .is_some_and(|s| matches!(s.outcome, Outcome::Answer(Answer::Failed(_))))
+    }
+
     fn current(&self) -> Option<&Snapshot> {
         self.candidate.as_ref().or(self.committed.as_ref())
     }
 
-    pub(super) fn view(&self, affects: usize, compare: Compare) -> ReadView<'_> {
+    pub(super) fn view(&self, affects: usize) -> ReadView<'_> {
         ReadView {
             current: self.current(),
             committed: self.committed.as_ref(),
             latest: self.current(),
-            pending: self.committed.as_ref().map(|committed| {
-                affects > 0
-                    || self
-                        .candidate
-                        .as_ref()
-                        .is_some_and(|next| !next.outcome.same(&committed.outcome, compare))
-            }),
+            pending: self
+                .committed
+                .as_ref()
+                .map(|_| affects > 0 || (self.has_candidate() && self.candidate_changed)),
         }
     }
 
@@ -40,6 +44,14 @@ impl AheadState {
 }
 
 impl<P> Node<P> {
+    pub(super) fn lane_candidate(&self) -> Option<&Snapshot> {
+        self.ahead.as_ref()?.candidate.as_ref()
+    }
+
+    pub(super) fn lane_candidate_mut(&mut self) -> Option<&mut Snapshot> {
+        self.ahead.as_mut()?.candidate.as_mut()
+    }
+
     pub(super) fn displayed(&self) -> Option<&Snapshot> {
         self.ahead
             .as_ref()
@@ -60,7 +72,7 @@ struct LaneReads<'a, P> {
 impl<P> LaneReads<'_, P> {
     fn view(node: &Node<P>) -> ReadView<'_> {
         if let Some(ahead) = &node.ahead {
-            return ahead.view(node.affects, node.compare);
+            return ahead.view(node.affects);
         }
         let committed = node.committed.as_ref();
         ReadView {
@@ -160,12 +172,21 @@ impl<P> LaneReads<'_, P> {
                 |previous| previous.version,
             );
         node.next_version = node.next_version.max(version);
+        ahead.candidate_changed = ahead
+            .committed
+            .as_ref()
+            .is_none_or(|old| !outcome.same(&old.outcome, node.compare));
+        let transactions = ahead
+            .candidate
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.transactions))
+            .unwrap_or_default();
         let previous = ahead.candidate.replace(Snapshot {
             outcome,
             version,
             question: ahead.question,
             reads,
-            transactions: Vec::new(),
+            transactions,
             proposal: false,
         });
         drop(previous);
@@ -205,17 +226,7 @@ impl<P> LaneReads<'_, P> {
 
     fn poll(&mut self, id: FlightId) -> Option<Progress> {
         let ahead = self.store.nodes.get_mut(id.node)?.ahead.as_mut()?;
-        let flight = ahead.flight.as_ref()?;
-        if flight.id != id || !flight.can_poll() {
-            return None;
-        }
-        let mut flight = ahead.flight.take().expect("validated flight");
-        let waker = self.mailbox.waker(id);
-        let progress = flight.poll(&mut Context::from_waker(&waker));
-        if !matches!(progress, Progress::Done(_)) {
-            ahead.flight = Some(flight);
-        }
-        Some(progress)
+        Flight::poll_slot(&mut ahead.flight, id, self.mailbox)
     }
 
     fn advance(&mut self, ready: impl Iterator<Item = FlightId>) -> Result<(), HandleError> {
@@ -264,6 +275,20 @@ impl<P> ReadGraph for LaneReads<'_, P> {
 }
 
 impl<P> Runtime<P> {
+    pub(super) fn commit_lane(&mut self, key: Key) -> (Option<Snapshot>, Option<FlightId>) {
+        let ahead = self
+            .store
+            .node_mut(key)
+            .ahead
+            .as_mut()
+            .expect("ahead state");
+        let mut snapshot = ahead.candidate.take().expect("ahead publication candidate");
+        snapshot.transactions.clear();
+        let previous = ahead.committed.replace(snapshot);
+        let resume = ahead.flight.as_mut().and_then(Flight::resume_after_commit);
+        (previous, resume)
+    }
+
     pub(super) fn adopt_main_ahead(&mut self, key: Key) -> Option<AheadState> {
         let node = self.store.node_mut(key);
         let ahead = node.ahead.as_deref_mut()?;
@@ -286,7 +311,9 @@ impl<P> Runtime<P> {
             .keys()
             .filter(|&key| {
                 let node = self.store.node(key);
-                node.ahead.is_some() && self.store.visible(node.owner)
+                node.ahead
+                    .as_ref()
+                    .is_some_and(|ahead| self.store.visible(node.owner) || ahead.recovering())
             })
             .collect();
         let mut lane = LaneReads {
@@ -343,6 +370,21 @@ impl<P> Runtime<P> {
                 .push(key);
         }
         for keys in publications.values() {
+            // Boundary changes need the same frame as every display sharing the lane.
+            let mut transactions: Vec<_> = keys
+                .iter()
+                .filter_map(|&key| self.store.node(key).lane_candidate())
+                .flat_map(|s| &s.transactions)
+                .copied()
+                .collect();
+            let boundary_change = keys.iter().any(|&key| {
+                let node = self.store.node(key);
+                node.role.is_render_reader()
+                    && node.lane_candidate().is_some_and(|s| {
+                        matches!(s.outcome, Outcome::Answer(Answer::Failed(_)))
+                            || node.ahead.as_ref().is_some_and(|ahead| ahead.recovering())
+                    })
+            });
             let blocked = keys.iter().any(|&key| {
                 let node = self.store.node(key);
                 node.role.is_render_reader()
@@ -353,6 +395,25 @@ impl<P> Runtime<P> {
                         .and_then(|ahead| ahead.current())
                         .is_some_and(|candidate| candidate.outcome.wait().is_some())
             });
+            if !transactions.is_empty() || (boundary_change && !blocked) {
+                if transactions.is_empty() {
+                    transactions.push(self.store.new_transaction());
+                }
+                transactions.sort_unstable();
+                transactions.dedup();
+                for &key in keys {
+                    let ahead = self
+                        .store
+                        .node_mut(key)
+                        .ahead
+                        .as_mut()
+                        .expect("ahead state");
+                    if let Some(candidate) = &mut ahead.candidate {
+                        candidate.transactions.clone_from(&transactions);
+                    }
+                }
+                continue;
+            }
             if blocked {
                 continue;
             }
@@ -398,15 +459,9 @@ impl<P> Runtime<P> {
                 self.sequence = sequence;
             }
             for key in staged {
-                let ahead = self
-                    .store
-                    .node_mut(key)
-                    .ahead
-                    .as_mut()
-                    .expect("ahead state");
-                let snapshot = ahead.candidate.take().expect("ahead publication candidate");
-                replaced.push(ahead.committed.replace(snapshot));
-                resume.extend(ahead.flight.as_mut().and_then(Flight::resume_after_commit));
+                let (previous, flight) = self.commit_lane(key);
+                replaced.push(previous);
+                resume.extend(flight);
             }
             drop(replaced);
             for id in resume {

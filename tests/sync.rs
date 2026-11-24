@@ -80,6 +80,36 @@ fn diamond_publishes_one_coherent_patch_after_batched_writes() {
 }
 
 #[test]
+fn manual_answer_tracks_the_new_question_after_a_selector_write() {
+    let mut rt = Runtime::<()>::new(|| {}).unwrap();
+    let mut handles = None;
+    rt.install(|root| {
+        let (selector, choose) = root.signal(true);
+        let (a, set_a) = root.signal(10);
+        let (b, set_b) = root.signal(20);
+        let (value, set) = root.derived_signal(move |cx| {
+            let source = if *cx.get(selector)? { a } else { b };
+            Ok(Derive::Value(*cx.get(source)?))
+        });
+        handles = Some((choose, set_a, set_b, value, set));
+    })
+    .unwrap();
+    let (choose, set_a, set_b, value, set) = handles.unwrap();
+    let mut sink = Recorder::default();
+    rt.flush(&mut sink).unwrap();
+    rt.set(choose, false).unwrap();
+    rt.set(set, 99).unwrap();
+    rt.flush(&mut sink).unwrap();
+    assert_eq!(*rt.committed(value).unwrap(), 99);
+    rt.set(set_a, 11).unwrap();
+    rt.flush(&mut sink).unwrap();
+    assert_eq!(*rt.committed(value).unwrap(), 99);
+    rt.set(set_b, 21).unwrap();
+    rt.flush(&mut sink).unwrap();
+    assert_eq!(*rt.committed(value).unwrap(), 21);
+}
+
+#[test]
 fn an_equal_result_still_rewires_dynamic_dependencies() {
     let mut runtime = Runtime::new(|| {}).unwrap();
     let mut writes = None;

@@ -106,6 +106,50 @@ fn affect_declarations_take_effect_on_the_next_tick_and_end_independently() {
 }
 
 #[test]
+fn disposing_a_source_read_only_by_a_lane_posts_its_fallback_tick() {
+    let posts = Arc::new(AtomicUsize::new(0));
+    let host = Arc::clone(&posts);
+    let mut rt = Runtime::new(move || {
+        host.fetch_add(1, Ordering::Relaxed);
+    })
+    .unwrap();
+    let mut source = None;
+    let source_owner = rt.install(|root| source = Some(root.signal(42).0)).unwrap();
+    let source = source.unwrap();
+    let mut flag = None;
+    let view_owner = rt
+        .install(|root| {
+            let (selector, _) = root.signal(0);
+            flag = Some(selector);
+            root.render_ahead(
+                move |cx| {
+                    if cx.is_pending(selector)? {
+                        match cx.get(source) {
+                            Ok(value) => Ok(*value),
+                            Err(ReadError::Handle(signals::HandleError::Disposed)) => Ok(-1),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        Ok(0)
+                    }
+                },
+                |value| value.to_string(),
+            );
+        })
+        .unwrap();
+    let mut frames = Frames::default();
+    rt.flush(&mut frames).unwrap();
+    rt.affects(view_owner, flag.unwrap()).unwrap();
+    rt.flush(&mut frames).unwrap();
+    assert_eq!(frames.0.last().unwrap(), &["42"]);
+    let before = posts.load(Ordering::Relaxed);
+    rt.dispose(source_owner).unwrap();
+    assert_eq!(posts.load(Ordering::Relaxed), before + 1);
+    rt.flush(&mut frames).unwrap();
+    assert_eq!(frames.0.last().unwrap(), &["-1"]);
+}
+
+#[test]
 fn switching_away_from_an_affect_owner_posts_the_removal_tick() {
     let posts = Arc::new(AtomicUsize::new(0));
     let host = posts.clone();
@@ -286,6 +330,149 @@ fn only_a_changed_question_is_pending_while_its_answer_is_staged() {
     runtime.flush(&mut frames).unwrap();
     assert!(!runtime.is_pending(source).unwrap());
     assert_eq!(*runtime.committed(source).unwrap(), 30);
+}
+
+#[test]
+fn untracked_reads_of_held_answers_do_not_call_value_equality() {
+    struct Checked(i32, Rc<std::cell::Cell<bool>>);
+    impl PartialEq for Checked {
+        fn eq(&self, other: &Self) -> bool {
+            assert!(!self.1.get(), "application equality during a public read");
+            self.0 == other.0
+        }
+    }
+    let armed = Rc::new(std::cell::Cell::new(false));
+    let mut rt = Runtime::new(|| {}).unwrap();
+    let mut handles = None;
+    rt.install(|root| {
+        let (id, write) = root.signal(Checked(1, armed.clone()));
+        let compare = armed.clone();
+        let ahead = root
+            .ahead_memo(move |cx| Ok(Derive::Value(Checked(cx.latest(id)?.0, compare.clone()))));
+        let gate = root.ahead_memo(move |cx| {
+            if cx.latest(id)?.0 == 2 {
+                Ok(Derive::Future(Box::pin(std::future::pending())))
+            } else {
+                Ok(Derive::Value(0))
+            }
+        });
+        root.render_ahead(
+            move |cx| Ok(cx.get(ahead)?.0 + *cx.get(gate)?),
+            |v| v.to_string(),
+        );
+        handles = Some((id, write, ahead));
+    })
+    .unwrap();
+    let (id, write, ahead) = handles.unwrap();
+    let mut frames = Frames::default();
+    rt.flush(&mut frames).unwrap();
+    rt.set(write, Checked(2, armed.clone())).unwrap();
+    rt.flush(&mut frames).unwrap();
+    armed.set(true);
+    for source in [id, ahead] {
+        assert_eq!(rt.committed(source).unwrap().0, 1);
+        assert_eq!(rt.latest(source).unwrap().0, 2);
+        assert!(rt.is_pending(source).unwrap());
+    }
+}
+
+#[test]
+fn lane_only_render_failure_reaches_errored_and_recovers_to_the_same_value() {
+    let mut rt = Runtime::new(|| {}).unwrap();
+    let mut write = None;
+    rt.install(|root| {
+        let (id, set_id) = root.signal(1);
+        write = Some(set_id);
+        let gate = root.memo(move |cx| {
+            if *cx.get(id)? == 1 {
+                Ok(Derive::Value(1))
+            } else {
+                Ok(Derive::Future(Box::pin(std::future::pending())))
+            }
+        });
+        root.render(move |cx| Ok(*cx.get(gate)?), |v| format!("main={v}"));
+        root.render_ahead(move |cx| Ok(*cx.latest(id)?), |v| format!("latest={v}"));
+        root.errored(
+            move |content| {
+                content.render_ahead(
+                    move |cx| {
+                        if *cx.get(id)? == 1 && *cx.latest(id)? == 2 {
+                            Err(ReadError::Failed(Rc::new(std::io::Error::other(
+                                "lane failed",
+                            ))))
+                        } else {
+                            Ok(10)
+                        }
+                    },
+                    |v| format!("content={v}"),
+                );
+            },
+            |fallback, error| {
+                fallback.render(move |cx| Ok(cx.get(error)?.to_string()), |v| v.to_string())
+            },
+        );
+    })
+    .unwrap();
+    let mut frames = Frames::default();
+    rt.flush(&mut frames).unwrap();
+    let write = write.unwrap();
+    rt.set(write, 2).unwrap();
+    rt.flush(&mut frames).unwrap();
+    assert_eq!(frames.0[1..], [vec!["latest=2", "lane failed"]]);
+    rt.set(write, 3).unwrap();
+    rt.flush(&mut frames).unwrap();
+    assert_eq!(frames.0[2..], [vec!["latest=3", "content=10"]]);
+}
+
+#[test]
+fn unhandled_lane_error_waits_for_its_group_then_poisons() {
+    let mut rt = Runtime::new(|| {}).unwrap();
+    let job = Rc::new(RefCell::new(Job::default()));
+    let mut handles = None;
+    rt.install(|root| {
+        let (id, set) = root.signal(1);
+        let gate = root.ahead_memo({
+            let job = job.clone();
+            move |cx| match (*cx.get(id)?, *cx.latest(id)?) {
+                (1, 1) => Ok(Derive::Value(0)),
+                (1, 2) => Ok(Derive::Future(Box::pin(Manual(job.clone())))),
+                (2, 2) => Ok(Derive::Future(Box::pin(std::future::pending()))),
+                state => panic!("unexpected inputs {state:?}"),
+            }
+        });
+        root.render_ahead(move |cx| Ok(*cx.get(gate)?), |v| v.to_string());
+        root.render_ahead(
+            move |cx| {
+                let latest = *cx.latest(id)?;
+                if latest == *cx.get(id)? {
+                    Ok(latest)
+                } else {
+                    Err(ReadError::Failed(Rc::new(std::io::Error::other(
+                        "unhandled",
+                    ))))
+                }
+            },
+            |v| v.to_string(),
+        );
+        handles = Some((id, set));
+    })
+    .unwrap();
+    let (id, set) = handles.unwrap();
+    let mut frames = Frames::default();
+    rt.flush(&mut frames).unwrap();
+    rt.set(set, 2).unwrap();
+    rt.flush(&mut frames).unwrap();
+    assert_eq!(frames.0.len(), 1);
+    complete(&job, 20);
+    assert!(matches!(
+        rt.flush(&mut frames),
+        Err(signals::FlushError::Poisoned)
+    ));
+    assert_eq!(frames.0.len(), 1);
+    assert!(matches!(
+        rt.committed(id),
+        Err(ReadError::Handle(signals::HandleError::Poisoned))
+    ));
 }
 
 #[test]

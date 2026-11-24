@@ -184,6 +184,7 @@ struct Node<P> {
     initial: Option<Snapshot>,
     committed: Option<Snapshot>,
     candidate: Option<Snapshot>,
+    candidate_changed: bool,
     subscribers: HashSet<Key>,
     command: Option<Command>,
     question: u64,
@@ -216,20 +217,12 @@ impl<P> Node<P> {
         self.candidate.as_ref().or(self.committed.as_ref())
     }
 
-    fn changed(&self) -> bool {
-        self.candidate.as_ref().is_some_and(|candidate| {
-            self.committed
-                .as_ref()
-                .is_none_or(|old| !candidate.outcome.same(&old.outcome, self.compare))
-        })
-    }
-
     fn pending_status(&self) -> bool {
         self.committed.as_ref().is_some_and(|committed| {
             self.affects > 0
                 || self.candidate.as_ref().is_some_and(|candidate| {
                     (matches!(self.role, Role::Source) || candidate.question != committed.question)
-                        && !candidate.outcome.same(&committed.outcome, self.compare)
+                        && self.candidate_changed
                 })
         })
     }
@@ -562,26 +555,6 @@ impl<P> Store<P> {
         } else {
             current.expect("unchanged answer has a snapshot").version
         };
-        let node = self.node(key);
-        if let Some(previous) = &node.candidate {
-            let removed: Vec<_> = previous
-                .reads
-                .iter()
-                .map(|dep| dep.source)
-                .filter(|source| {
-                    !reads.iter().any(|dep| dep.source == *source)
-                        && !node
-                            .committed
-                            .as_ref()
-                            .is_some_and(|s| s.reads.iter().any(|dep| dep.source == *source))
-                })
-                .collect();
-            for source in removed {
-                if let Some(node) = self.nodes.get_mut(source) {
-                    node.subscribers.remove(&key);
-                }
-            }
-        }
         for dep in &reads {
             if let Some(node) = self.nodes.get_mut(dep.source) {
                 node.subscribers.insert(key);
@@ -591,6 +564,10 @@ impl<P> Store<P> {
         transactions.dedup();
         let node = self.node_mut(key);
         node.next_version = node.next_version.max(version);
+        node.candidate_changed = node
+            .committed
+            .as_ref()
+            .is_none_or(|old| !outcome.same(&old.outcome, node.compare));
         let previous = node.candidate.replace(Snapshot {
             outcome,
             version,
@@ -599,7 +576,9 @@ impl<P> Store<P> {
             transactions,
             proposal,
         });
-        drop(previous);
+        if let Some(previous) = &previous {
+            self.prune_subscriptions(key, previous);
+        }
         changed
     }
 
@@ -609,7 +588,7 @@ impl<P> Store<P> {
             .candidate
             .take()
             .expect("prepared candidate");
-        self.commit_frame(key, candidate)
+        self.commit_frame(key, candidate, false)
     }
 
     fn discard_candidate(&mut self, key: Key) -> Option<(Snapshot, Option<Flight>)> {
@@ -618,23 +597,16 @@ impl<P> Store<P> {
         let flight = (!candidate.transactions.is_empty())
             .then(|| node.flight.take())
             .flatten();
-        for dep in &candidate.reads {
-            let still_read = self.node(key).committed.as_ref().is_some_and(|snapshot| {
-                snapshot
-                    .reads
-                    .iter()
-                    .any(|current| current.source == dep.source)
-            });
-            if !still_read {
-                if let Some(source) = self.nodes.get_mut(dep.source) {
-                    source.subscribers.remove(&key);
-                }
-            }
-        }
+        self.prune_subscriptions(key, &candidate);
         Some((candidate, flight))
     }
 
-    fn commit_frame(&mut self, key: Key, mut snapshot: Snapshot) -> Option<Snapshot> {
+    fn commit_frame(
+        &mut self,
+        key: Key,
+        mut snapshot: Snapshot,
+        candidate_changed: bool,
+    ) -> Option<Snapshot> {
         snapshot.transactions.clear();
         for dep in &snapshot.reads {
             if let Some(source) = self.nodes.get_mut(dep.source) {
@@ -643,28 +615,33 @@ impl<P> Store<P> {
         }
         let node = self.node_mut(key);
         node.next_version = node.next_version.max(snapshot.version);
+        node.candidate_changed = candidate_changed;
         let previous = node.committed.replace(snapshot);
         if let Some(previous) = &previous {
-            for dep in &previous.reads {
-                let node = self.node(key);
-                let still_read = node
-                    .committed
-                    .iter()
-                    .chain(&node.candidate)
-                    .any(|snapshot| {
-                        snapshot
-                            .reads
-                            .iter()
-                            .any(|current| current.source == dep.source)
-                    });
-                if !still_read {
-                    if let Some(source) = self.nodes.get_mut(dep.source) {
-                        source.subscribers.remove(&key);
-                    }
+            self.prune_subscriptions(key, previous);
+        }
+        previous
+    }
+
+    fn prune_subscriptions(&mut self, key: Key, previous: &Snapshot) {
+        for dep in &previous.reads {
+            let node = self.node(key);
+            let still_read = node
+                .committed
+                .iter()
+                .chain(&node.candidate)
+                .any(|snapshot| {
+                    snapshot
+                        .reads
+                        .iter()
+                        .any(|current| current.source == dep.source)
+                });
+            if !still_read {
+                if let Some(source) = self.nodes.get_mut(dep.source) {
+                    source.subscribers.remove(&key);
                 }
             }
         }
-        previous
     }
 
     fn remove_tree(&mut self, owner: Owner, retired: &mut Vec<Retired<P>>) {
@@ -778,6 +755,7 @@ impl<P> Registration<P> {
             }),
             committed: None,
             candidate: None,
+            candidate_changed: false,
             subscribers: HashSet::new(),
             command: None,
             question: 0,
@@ -1087,7 +1065,6 @@ impl<P> Runtime<P> {
         };
         node.running = true;
         let previous = node.current().map(|snapshot| snapshot.reads.clone());
-        let had_snapshot = previous.is_some();
         let command = node.command.take();
         let forced = command.is_some();
         let manual = match command {
@@ -1111,7 +1088,7 @@ impl<P> Runtime<P> {
                     }
                 }
                 unchanged &= dep.version == version;
-                if !unchanged && manual.is_none() {
+                if !unchanged {
                     break;
                 }
                 reads.push(Dependency {
@@ -1125,7 +1102,7 @@ impl<P> Runtime<P> {
                 self.store.node_mut(key).running = false;
                 return Ok(());
             }
-            if manual.is_none() {
+            if new_question || manual.is_none() {
                 reads.clear();
             }
         }
@@ -1138,7 +1115,7 @@ impl<P> Runtime<P> {
         }
         let retired = node.flight.take();
         drop(retired);
-        if let Some(value) = manual.as_ref().filter(|_| had_snapshot) {
+        if let Some(value) = manual.as_ref().filter(|_| !new_question) {
             self.finish_evaluation(
                 key,
                 Outcome::Answer(Answer::Value(Rc::clone(value))),
@@ -1248,7 +1225,9 @@ impl<P> Runtime<P> {
         };
         let snapshot = node.candidate.as_ref().expect("staged switch key");
         let value = match &snapshot.outcome {
-            Outcome::Answer(Answer::Value(value)) if node.changed() || switch.active.is_none() => {
+            Outcome::Answer(Answer::Value(value))
+                if node.candidate_changed || switch.active.is_none() =>
+            {
                 Some(Rc::clone(value))
             }
             _ => None,
@@ -1495,6 +1474,10 @@ impl<P> Runtime<P> {
         let mut ids = BTreeSet::new();
         for key in self.store.nodes.keys() {
             let node = self.store.node(key);
+            if let Some(lane) = node.lane_candidate() {
+                ids.extend(lane.transactions.iter().copied());
+                groups.join(&lane.transactions);
+            }
             ids.extend(
                 node.effect_error
                     .as_ref()
@@ -1572,6 +1555,16 @@ impl<P> Runtime<P> {
         transaction: Transaction,
     ) -> Result<PublishGroup, FlushError> {
         let keys: Vec<_> = self.store.nodes.keys().collect();
+        if keys.iter().any(|&key| {
+            let node = self.store.node(key);
+            node.role.is_render_reader()
+                && self.store.visible(node.owner)
+                && node.lane_candidate().is_some_and(|s| {
+                    groups.accepts(transaction, &s.transactions) && s.outcome.wait().is_some()
+                })
+        }) {
+            return Ok(PublishGroup::Held);
+        }
         let mut switches = Vec::new();
         let mut retiring = HashSet::new();
         for &key in &keys {
@@ -1780,6 +1773,7 @@ impl<P> Runtime<P> {
         }
 
         let mut staged = Vec::new();
+        let mut staged_lane = Vec::new();
         let mut effects = Vec::new();
         for &key in &keys {
             let node = self.store.node(key);
@@ -1790,18 +1784,23 @@ impl<P> Runtime<P> {
                 .candidate
                 .as_ref()
                 .filter(|candidate| groups.accepts(transaction, &candidate.transactions));
-            let next = projected.get(&key).or(candidate);
+            let lane = node
+                .lane_candidate()
+                .filter(|s| groups.accepts(transaction, &s.transactions));
+            let main = projected.get(&key).or(candidate);
+            let next = main.or(lane);
             let showing = visible.contains(&node.owner);
             let exposed = showing && !self.store.visible(node.owner);
-            let Some(snapshot) =
-                next.or_else(|| exposed.then_some(node.committed.as_ref()).flatten())
+            let Some(snapshot) = next.or_else(|| exposed.then_some(node.displayed()).flatten())
             else {
                 continue;
             };
             let Outcome::Answer(answer) = &snapshot.outcome else {
                 continue;
             };
-            if candidate.is_some() && !projected.contains_key(&key) {
+            if main.is_none() && lane.is_some() {
+                staged_lane.push(key);
+            } else if candidate.is_some() && !projected.contains_key(&key) {
                 staged.push(key);
             }
             if !showing {
@@ -1848,7 +1847,17 @@ impl<P> Runtime<P> {
             self.store.attached_descendants(owner, &mut removed);
         }
         ops.extend(removed.into_iter().map(FrameOp::Remove));
-        let mut replaced = Vec::with_capacity(staged.len() + projected.len());
+        let projected: Vec<_> = projected
+            .into_iter()
+            .map(|(key, snapshot)| {
+                let node = self.store.node(key);
+                let candidate_changed = node.candidate.as_ref().is_some_and(|candidate| {
+                    !candidate.outcome.same(&snapshot.outcome, node.compare)
+                });
+                (key, snapshot, candidate_changed)
+            })
+            .collect();
+        let mut replaced = Vec::with_capacity(staged.len() + projected.len() + staged_lane.len());
         let mut replaced_ahead = Vec::with_capacity(staged.len() + projected.len());
         let mut resume = Vec::with_capacity(staged.len());
         if !ops.is_empty() {
@@ -1897,12 +1906,22 @@ impl<P> Runtime<P> {
                 resume.push(id);
             }
         }
-        for (key, snapshot) in projected {
-            replaced.push(self.store.commit_frame(key, snapshot));
+        for (key, snapshot, candidate_changed) in projected {
+            replaced.push(self.store.commit_frame(key, snapshot, candidate_changed));
             replaced_ahead.extend(self.adopt_main_ahead(key));
+        }
+        for key in staged_lane {
+            let (previous, flight) = self.commit_lane(key);
+            replaced.push(previous);
+            resume.extend(flight);
         }
         for &key in &keys {
             let node = self.store.node_mut(key);
+            if let Some(candidate) = node.lane_candidate_mut() {
+                candidate
+                    .transactions
+                    .retain(|&id| groups.representative(id) != transaction);
+            }
             if let Some(candidate) = &mut node.candidate {
                 candidate
                     .transactions
@@ -2068,20 +2087,8 @@ impl<P> Drive<P> for Runtime<P> {
             if layout_changed {
                 runtime.layout = Some(runtime.store.new_transaction());
             }
-            if layout_changed
-                || !runtime.store.dirty.is_empty()
-                || !runtime.store.affect_changes.is_empty()
-                || runtime.store.nodes.keys().any(|key| {
-                    runtime
-                        .store
-                        .node(key)
-                        .candidate
-                        .as_ref()
-                        .is_some_and(|snapshot| !snapshot.transactions.is_empty())
-                })
-            {
-                runtime.request_tick();
-            }
+            // Displayed lanes may have read a removed node independently of the main graph.
+            runtime.request_tick();
         });
         Ok(())
     }
@@ -2128,7 +2135,7 @@ impl<P> Drive<P> for Runtime<P> {
         if let Some(ahead) = &node.ahead {
             if ahead.has_candidate() {
                 return ahead
-                    .view(node.affects, node.compare)
+                    .view(node.affects)
                     .read::<P>(source.0, ReadMode::Latest)
                     .map(downcast);
             }
@@ -2158,12 +2165,7 @@ impl<P> Drive<P> for Runtime<P> {
             .filter(|ahead| ahead.has_candidate())
             .map_or_else(
                 || node.pending_status(),
-                |ahead| {
-                    ahead
-                        .view(node.affects, node.compare)
-                        .pending
-                        .unwrap_or(false)
-                },
+                |ahead| ahead.view(node.affects).pending.unwrap_or(false),
             ))
     }
 

@@ -168,10 +168,20 @@ impl BoundaryPlan {
     }
 
     fn issue<P>(projection: &FrameReads<'_, P>, key: Key) -> Issues {
-        match projection
-            .reader_snapshot(key)
-            .map(|snapshot| &snapshot.outcome)
-        {
+        let node = projection.store.node(key);
+        let in_group = |s: &&Snapshot| {
+            projection
+                .groups
+                .accepts(projection.transaction, &s.transactions)
+        };
+        let snapshot = projection
+            .values
+            .get(&key)
+            .or_else(|| node.candidate.as_ref().filter(in_group))
+            .or_else(|| node.lane_candidate().filter(in_group))
+            .or_else(|| node.ahead.as_ref().and_then(|_| node.displayed()))
+            .or_else(|| projection.reader_snapshot(key));
+        match snapshot.map(|snapshot| &snapshot.outcome) {
             Some(Outcome::Answer(Answer::Value(_))) => Issues::default(),
             Some(Outcome::Answer(Answer::Failed(error))) => Issues {
                 waiting: false,
