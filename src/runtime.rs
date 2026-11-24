@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, HashSet},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet},
     fmt,
     panic::{self, AssertUnwindSafe},
     sync::{
@@ -21,6 +21,7 @@ type Compute = Rc<dyn Fn(&mut Cx<'_>) -> Read<Computed>>;
 type Compare = fn(&Value, &Value) -> bool;
 type Render<P> = Rc<dyn Fn(Value) -> P>;
 type ApplyEffect = Box<dyn FnMut(&mut EffectCx<'_>, Value) -> JobResult<()>>;
+type BuildBranch<P> = Rc<dyn Fn(&mut Registration<P>, Value)>;
 
 #[derive(Clone)]
 enum Answer {
@@ -99,6 +100,51 @@ struct Snapshot {
     version: u64,
     question: u64,
     reads: Vec<Dependency>,
+    transactions: Vec<Transaction>,
+    proposal: bool,
+}
+
+type Transaction = u64;
+
+#[derive(Default)]
+struct TransactionGroups {
+    parents: BTreeMap<Transaction, Transaction>,
+    held: HashSet<Transaction>,
+}
+
+impl TransactionGroups {
+    fn representative(&self, mut transaction: Transaction) -> Transaction {
+        while let Some(&parent) = self.parents.get(&transaction) {
+            transaction = parent;
+        }
+        transaction
+    }
+
+    fn join(&mut self, transactions: &[Transaction]) {
+        let Some((&first, others)) = transactions.split_first() else {
+            return;
+        };
+        for &other in others {
+            let first = self.representative(first);
+            let other = self.representative(other);
+            if first != other {
+                self.parents.insert(first.max(other), first.min(other));
+            }
+        }
+    }
+
+    fn hold(&mut self, transactions: &[Transaction]) {
+        for &id in transactions {
+            self.held.insert(self.representative(id));
+        }
+    }
+
+    fn accepts(&self, transaction: Transaction, transactions: &[Transaction]) -> bool {
+        !transactions.is_empty()
+            && transactions
+                .iter()
+                .all(|&id| self.representative(id) == transaction)
+    }
 }
 
 enum Role<P> {
@@ -106,6 +152,13 @@ enum Role<P> {
     Memo,
     Render(Render<P>),
     Effect(Option<ApplyEffect>),
+    Switch(Switch<P>),
+}
+
+struct Switch<P> {
+    build: BuildBranch<P>,
+    active: Option<Owner>,
+    candidate: Option<(Owner, Value)>,
 }
 
 enum Command {
@@ -125,6 +178,7 @@ struct Node<P> {
     subscribers: HashSet<Key>,
     command: Option<Command>,
     question: u64,
+    next_version: u64,
     flight: Option<Flight>,
     height: u32,
     queued: Option<u64>,
@@ -138,7 +192,9 @@ impl<P> Node<P> {
 
     fn changed(&self) -> bool {
         self.candidate.as_ref().is_some_and(|candidate| {
-            self.committed.as_ref().map(|s| s.version) != Some(candidate.version)
+            self.committed
+                .as_ref()
+                .is_none_or(|old| !candidate.outcome.same(&old.outcome, self.compare))
         })
     }
 }
@@ -149,8 +205,11 @@ enum Resource {
 }
 
 struct OwnerState {
+    parent: Option<Owner>,
     children: Vec<Owner>,
     resources: Vec<Resource>,
+    registration: Option<Transaction>,
+    branch: Option<Key>,
 }
 
 enum Retired<P> {
@@ -166,6 +225,7 @@ struct Store<P> {
     new_sources: Vec<Key>,
     dirty: BinaryHeap<Reverse<(u32, u64, Key)>>,
     next_enqueue: u64,
+    next_transaction: Transaction,
 }
 
 impl<P> Store<P> {
@@ -178,6 +238,7 @@ impl<P> Store<P> {
             new_sources: Vec::new(),
             dirty: BinaryHeap::new(),
             next_enqueue: 0,
+            next_transaction: 0,
         }
     }
 
@@ -194,14 +255,78 @@ impl<P> Store<P> {
     }
 
     fn create_root(&mut self) -> Owner {
+        let transaction = self.new_transaction();
+        self.create_owner(None, transaction, None)
+    }
+
+    fn create_owner(
+        &mut self,
+        parent: Option<Owner>,
+        transaction: Transaction,
+        branch: Option<Key>,
+    ) -> Owner {
         let key = self.owners.insert(OwnerState {
+            parent,
             children: Vec::new(),
             resources: Vec::new(),
+            registration: Some(transaction),
+            branch,
         });
         let owner = Owner(key, PhantomData);
-        self.roots.push(owner);
+        if let Some(parent) = parent {
+            self.owner_mut(parent).children.push(owner);
+        } else {
+            self.roots.push(owner);
+        }
         self.attach.push(owner);
         owner
+    }
+
+    fn replacing(&self, mut owner: Owner) -> Option<&Snapshot> {
+        while let Some(state) = self.owners.get(owner.0) {
+            if let Some(key) = state.branch {
+                let node = self.node(key);
+                let Role::Switch(switch) = &node.role else {
+                    unreachable!("branch owner belongs to a switch")
+                };
+                if switch.active == Some(owner) && switch.candidate.is_some() {
+                    return node.candidate.as_ref();
+                }
+            }
+            owner = state.parent?;
+        }
+        None
+    }
+
+    fn owned_by(&self, mut owner: Owner, roots: &HashSet<Owner>) -> bool {
+        loop {
+            if roots.contains(&owner) {
+                return true;
+            }
+            let Some(parent) = self.owners.get(owner.0).and_then(|state| state.parent) else {
+                return false;
+            };
+            owner = parent;
+        }
+    }
+
+    fn attached_descendants(&self, owner: Owner, removal: &mut Vec<Owner>) {
+        if let Some(state) = self.owners.get(owner.0) {
+            if state.registration.is_none() {
+                for &child in &state.children {
+                    self.attached_descendants(child, removal);
+                }
+                removal.push(owner);
+            }
+        }
+    }
+
+    fn new_transaction(&mut self) -> Transaction {
+        self.next_transaction = self
+            .next_transaction
+            .checked_add(1)
+            .expect("transaction ID exhausted");
+        self.next_transaction
     }
 
     fn schedule(&mut self, key: Key) {
@@ -231,18 +356,27 @@ impl<P> Store<P> {
         }
     }
 
-    fn stage(&mut self, key: Key, outcome: Outcome, reads: Vec<Dependency>) -> bool {
+    fn stage(
+        &mut self,
+        key: Key,
+        outcome: Outcome,
+        reads: Vec<Dependency>,
+        mut transactions: Vec<Transaction>,
+        proposal: bool,
+    ) -> bool {
         let node = self.node(key);
         let current = node.current();
-        let previous_version = current.map_or(0, |s| s.version);
         let question = node.question;
-        let changed = current.is_none_or(|previous| !outcome.same(&previous.outcome, node.compare));
+        let changed = current.is_none_or(|previous| {
+            !outcome.same(&previous.outcome, node.compare)
+                || (outcome.wait().is_some() && question != previous.question)
+        });
         let version = if changed {
-            previous_version
+            node.next_version
                 .checked_add(1)
                 .expect("answer version exhausted")
         } else {
-            previous_version
+            current.expect("unchanged answer has a snapshot").version
         };
         let node = self.node(key);
         if let Some(previous) = &node.candidate {
@@ -269,28 +403,77 @@ impl<P> Store<P> {
                 node.subscribers.insert(key);
             }
         }
-        let previous = self.node_mut(key).candidate.replace(Snapshot {
+        transactions.sort_unstable();
+        transactions.dedup();
+        let node = self.node_mut(key);
+        node.next_version = node.next_version.max(version);
+        let previous = node.candidate.replace(Snapshot {
             outcome,
             version,
             question,
             reads,
+            transactions,
+            proposal,
         });
         drop(previous);
         changed
     }
 
     fn commit(&mut self, key: Key) -> Option<Snapshot> {
+        let candidate = self
+            .node_mut(key)
+            .candidate
+            .take()
+            .expect("prepared candidate");
+        self.commit_frame(key, candidate)
+    }
+
+    fn discard_candidate(&mut self, key: Key) -> Option<(Snapshot, Option<Flight>)> {
         let node = self.node_mut(key);
-        let candidate = node.candidate.take().expect("prepared candidate");
-        let previous = node.committed.replace(candidate);
-        if let Some(previous) = &previous {
-            for dep in &previous.reads {
-                let snapshot = self.node(key).committed.as_ref().expect("committed answer");
-                if !snapshot
+        let candidate = node.candidate.take()?;
+        let flight = (!candidate.transactions.is_empty())
+            .then(|| node.flight.take())
+            .flatten();
+        for dep in &candidate.reads {
+            let still_read = self.node(key).committed.as_ref().is_some_and(|snapshot| {
+                snapshot
                     .reads
                     .iter()
                     .any(|current| current.source == dep.source)
-                {
+            });
+            if !still_read {
+                if let Some(source) = self.nodes.get_mut(dep.source) {
+                    source.subscribers.remove(&key);
+                }
+            }
+        }
+        Some((candidate, flight))
+    }
+
+    fn commit_frame(&mut self, key: Key, mut snapshot: Snapshot) -> Option<Snapshot> {
+        snapshot.transactions.clear();
+        for dep in &snapshot.reads {
+            if let Some(source) = self.nodes.get_mut(dep.source) {
+                source.subscribers.insert(key);
+            }
+        }
+        let node = self.node_mut(key);
+        node.next_version = node.next_version.max(snapshot.version);
+        let previous = node.committed.replace(snapshot);
+        if let Some(previous) = &previous {
+            for dep in &previous.reads {
+                let node = self.node(key);
+                let still_read = node
+                    .committed
+                    .iter()
+                    .chain(&node.candidate)
+                    .any(|snapshot| {
+                        snapshot
+                            .reads
+                            .iter()
+                            .any(|current| current.source == dep.source)
+                    });
+                if !still_read {
                     if let Some(source) = self.nodes.get_mut(dep.source) {
                         source.subscribers.remove(&key);
                     }
@@ -301,6 +484,11 @@ impl<P> Store<P> {
     }
 
     fn remove_tree(&mut self, owner: Owner, retired: &mut Vec<Retired<P>>) {
+        if let Some(parent) = self.owners.get(owner.0).and_then(|owner| owner.parent) {
+            self.owner_mut(parent)
+                .children
+                .retain(|child| *child != owner);
+        }
         let mut owners = Vec::new();
         let mut pending = vec![owner];
         while let Some(owner) = pending.pop() {
@@ -334,6 +522,155 @@ impl<P> Store<P> {
             }
         }
         self.roots.retain(|root| *root != owner);
+        self.attach
+            .retain(|owner| self.owners.get(owner.0).is_some());
+    }
+}
+
+struct FrameReads<'a, P> {
+    id: u64,
+    store: &'a Store<P>,
+    groups: &'a TransactionGroups,
+    transaction: Transaction,
+    retiring: &'a HashSet<Owner>,
+    checked: HashSet<Key>,
+    running: HashSet<Key>,
+    values: BTreeMap<Key, Snapshot>,
+}
+
+impl<P> FrameReads<'_, P> {
+    fn snapshot(&self, key: Key) -> Option<&Snapshot> {
+        let node = self.store.nodes.get(key)?;
+        self.values
+            .get(&key)
+            .or_else(|| {
+                node.candidate.as_ref().filter(|candidate| {
+                    !self.store.owned_by(node.owner, self.retiring)
+                        && self
+                            .groups
+                            .accepts(self.transaction, &candidate.transactions)
+                })
+            })
+            .or(node.committed.as_ref())
+    }
+
+    fn resolve(&mut self, key: Key) -> Result<(), HandleError> {
+        if !self.checked.insert(key) {
+            return Ok(());
+        }
+        let Some(node) = self.store.nodes.get(key) else {
+            return Ok(());
+        };
+        let (Some(compute), Some(previous)) = (node.compute.clone(), node.committed.as_ref())
+        else {
+            return Ok(());
+        };
+        if matches!(node.role, Role::Switch(_))
+            || self.store.owned_by(node.owner, self.retiring)
+            || self
+                .snapshot(key)
+                .is_some_and(|snapshot| !std::ptr::eq(snapshot, previous))
+        {
+            return Ok(());
+        }
+        self.running.insert(key);
+        let mut changed = false;
+        for dep in &previous.reads {
+            self.resolve(dep.source)?;
+            let version = if self.running.contains(&dep.source) {
+                0
+            } else {
+                self.snapshot(dep.source)
+                    .map_or(0, |snapshot| snapshot.version)
+            };
+            if version != dep.version {
+                changed = true;
+                break;
+            }
+        }
+        if changed {
+            let mut reads = Vec::new();
+            let result = compute(&mut Cx {
+                graph: self,
+                reads: &mut reads,
+            });
+            let outcome = match result {
+                Ok(Computed::Value(value)) => Outcome::Answer(Answer::Value(value)),
+                Err(ReadError::Failed(error)) => Outcome::Answer(Answer::Failed(error)),
+                Err(ReadError::Handle(error)) => return Err(error),
+                Err(ReadError::Pending(wait)) => {
+                    if !reads.iter().any(|dep| {
+                        self.snapshot(dep.source).map_or_else(
+                            || matches!(Runtime::<P>::pending(dep.source), ReadError::Pending(token)
+                                if dep.version == 0 && token == wait),
+                            |snapshot| snapshot.version == dep.version && snapshot.outcome.wait() == Some(wait),
+                        )
+                    }) {
+                        return Err(HandleError::Poisoned);
+                    }
+                    Outcome::Pending {
+                        wait,
+                        retained: None,
+                    }
+                }
+                Ok(Computed::Job(_)) => Outcome::Pending {
+                    wait: PendingRead {
+                        attempt: 0,
+                        wait: u64::from(key.index),
+                    },
+                    retained: None,
+                },
+            };
+            let version = if outcome.same(&previous.outcome, node.compare) {
+                previous.version
+            } else {
+                node.next_version
+                    .checked_add(1)
+                    .expect("answer version exhausted")
+            };
+            self.values.insert(
+                key,
+                Snapshot {
+                    outcome,
+                    version,
+                    question: previous.question,
+                    reads,
+                    transactions: Vec::new(),
+                    proposal: false,
+                },
+            );
+        }
+        self.running.remove(&key);
+        Ok(())
+    }
+}
+
+impl<P> ReadGraph for FrameReads<'_, P> {
+    fn read(&mut self, key: Key, ty: TypeId, reads: &mut Vec<Dependency>) -> Read<Value> {
+        if key.runtime != self.id {
+            return Err(ReadError::Handle(HandleError::WrongRuntime));
+        }
+        let node = self.store.nodes.get(key).ok_or(HandleError::Disposed)?;
+        assert_eq!(node.ty, ty, "handle has a different type than its node");
+        if self.running.contains(&key) {
+            reads.push(Dependency {
+                source: key,
+                version: 0,
+            });
+            return Err(ReadError::Failed(Rc::new(Cycle)));
+        }
+        self.resolve(key)?;
+        let snapshot = self.snapshot(key);
+        if !reads.iter().any(|dep| dep.source == key) {
+            reads.push(Dependency {
+                source: key,
+                version: snapshot.map_or(0, |snapshot| snapshot.version),
+            });
+        }
+        snapshot
+            .ok_or_else(|| Runtime::<P>::pending(key))?
+            .outcome
+            .read()
     }
 }
 
@@ -378,12 +715,15 @@ impl<P> Registration<P> {
                 version: 1,
                 question: 0,
                 reads: Vec::new(),
+                transactions: Vec::new(),
+                proposal: false,
             }),
             committed: None,
             candidate: None,
             subscribers: HashSet::new(),
             command: None,
             question: 0,
+            next_version: 0,
             flight: None,
             height: 0,
             queued: None,
@@ -475,6 +815,30 @@ impl<P> Register<P> for Registration<P> {
             .resources
             .push(Resource::Cleanup(Box::new(cleanup)));
     }
+
+    fn switch<K: PartialEq + 'static>(
+        &mut self,
+        key: impl Fn(&mut Cx<'_>) -> Read<K> + 'static,
+        build: impl Fn(&mut Self, Rc<K>) + 'static,
+    ) {
+        let parent = self.owner;
+        let transaction = self
+            .store
+            .owner_mut(parent)
+            .registration
+            .expect("registering into an unpublished owner");
+        self.owner = self.store.create_owner(Some(parent), transaction, None);
+        self.register::<K>(
+            Role::Switch(Switch {
+                build: Rc::new(move |reg, value| build(reg, downcast(value))),
+                active: None,
+                candidate: None,
+            }),
+            Some(Rc::new(move |cx| Ok(Computed::Value(Rc::new(key(cx)?))))),
+            None,
+        );
+        self.owner = parent;
+    }
 }
 
 pub struct Runtime<P> {
@@ -483,6 +847,7 @@ pub struct Runtime<P> {
     inputs: Vec<(Key, Command)>,
     mailbox: Arc<Mailbox>,
     next_flight: u64,
+    transaction: Transaction,
     busy: bool,
     poisoned: bool,
     sequence: u64,
@@ -510,6 +875,7 @@ impl<P> Runtime<P> {
             inputs: Vec::new(),
             mailbox: Mailbox::new(wake_host),
             next_flight: 0,
+            transaction: 0,
             busy: false,
             poisoned: false,
             sequence: 0,
@@ -531,6 +897,21 @@ impl<P> Runtime<P> {
 
     fn request_tick(&mut self) {
         self.guarded(|runtime| runtime.mailbox.request_tick(None));
+    }
+
+    fn build_owner(&mut self, owner: Owner, build: impl FnOnce(&mut Registration<P>)) {
+        let mut reg = Registration {
+            store: std::mem::replace(&mut self.store, Store::new(self.id)),
+            owner,
+        };
+        let result = panic::catch_unwind(AssertUnwindSafe(|| build(&mut reg)));
+        self.store = reg.store;
+        if let Err(payload) = result {
+            let mut retired = Vec::new();
+            self.store.remove_tree(owner, &mut retired);
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| clean(retired)));
+            panic::resume_unwind(payload);
+        }
     }
 
     fn check_key(&self, key: Key) -> Result<(), HandleError> {
@@ -618,7 +999,12 @@ impl<P> Runtime<P> {
         let retired = node.flight.take();
         drop(retired);
         if let Some(value) = manual.as_ref().filter(|_| had_snapshot) {
-            self.finish_evaluation(key, Outcome::Answer(Answer::Value(Rc::clone(value))), reads);
+            self.finish_evaluation(
+                key,
+                Outcome::Answer(Answer::Value(Rc::clone(value))),
+                reads,
+                forced,
+            );
             return Ok(());
         }
         let result = compute(&mut Cx {
@@ -656,11 +1042,17 @@ impl<P> Runtime<P> {
         if self.poisoned {
             return Err(HandleError::Poisoned);
         }
-        self.finish_evaluation(key, outcome, reads);
+        self.finish_evaluation(key, outcome, reads, forced);
         Ok(())
     }
 
-    fn finish_evaluation(&mut self, key: Key, outcome: Outcome, reads: Vec<Dependency>) -> bool {
+    fn finish_evaluation(
+        &mut self,
+        key: Key,
+        outcome: Outcome,
+        reads: Vec<Dependency>,
+        forced: bool,
+    ) {
         let height = reads
             .iter()
             .filter(|dep| dep.version != 0)
@@ -671,7 +1063,91 @@ impl<P> Runtime<P> {
         let node = self.store.node_mut(key);
         node.height = node.height.max(height);
         node.running = false;
-        self.store.stage(key, outcome, reads)
+        let mut transactions: Vec<_> = reads
+            .iter()
+            .filter_map(|dep| {
+                self.store
+                    .nodes
+                    .get(dep.source)?
+                    .candidate
+                    .as_ref()
+                    .filter(|candidate| candidate.version == dep.version)
+            })
+            .flat_map(|candidate| candidate.transactions.iter().copied())
+            .collect();
+        let node = self.store.node(key);
+        if let Some(transaction) = (!matches!(node.role, Role::Memo))
+            .then(|| {
+                self.store
+                    .owners
+                    .get(node.owner.0)
+                    .and_then(|owner| owner.registration)
+            })
+            .flatten()
+        {
+            transactions.push(transaction);
+        }
+        if forced {
+            if let Some(candidate) = &node.candidate {
+                transactions.extend(&candidate.transactions);
+            }
+        }
+        if forced {
+            transactions.push(self.transaction);
+        } else if transactions.is_empty() {
+            transactions.push(self.store.new_transaction());
+        }
+        self.store.stage(key, outcome, reads, transactions, forced);
+        self.refresh_switch(key);
+    }
+
+    fn refresh_switch(&mut self, key: Key) {
+        let node = self.store.node(key);
+        let Role::Switch(switch) = &node.role else {
+            return;
+        };
+        let snapshot = node.candidate.as_ref().expect("staged switch key");
+        let value = match &snapshot.outcome {
+            Outcome::Answer(Answer::Value(value)) if node.changed() || switch.active.is_none() => {
+                Some(Rc::clone(value))
+            }
+            _ => None,
+        };
+        if let (Some((owner, previous)), Some(value)) = (&switch.candidate, &value) {
+            if (node.compare)(previous, value) && self.store.owners.get(owner.0).is_some() {
+                let transaction = self.store.owners.get(owner.0).unwrap().registration;
+                self.store
+                    .node_mut(key)
+                    .candidate
+                    .as_mut()
+                    .unwrap()
+                    .transactions
+                    .extend(transaction);
+                return;
+            }
+        }
+        let parent = node.owner;
+        let transaction = snapshot.transactions[0];
+        let build = Rc::clone(&switch.build);
+        let Role::Switch(switch) = &mut self.store.node_mut(key).role else {
+            unreachable!()
+        };
+        if let Some((obsolete, _)) = switch.candidate.take() {
+            let mut retired = Vec::new();
+            self.store.remove_tree(obsolete, &mut retired);
+            clean(retired);
+        }
+        if let Some(value) = value {
+            let owner = self
+                .store
+                .create_owner(Some(parent), transaction, Some(key));
+            self.build_owner(owner, |reg| build(reg, Rc::clone(&value)));
+            let Role::Switch(switch) = &mut self.store.node_mut(key).role else {
+                unreachable!()
+            };
+            switch.candidate = Some((owner, value));
+            self.seed_sources();
+        }
     }
 
     fn start_flight(&mut self, key: Key, work: Work) -> Outcome {
@@ -730,12 +1206,21 @@ impl<P> Runtime<P> {
         }
     }
 
-    fn promote_inputs(&mut self) {
+    fn seed_sources(&mut self) {
         for key in std::mem::take(&mut self.store.new_sources) {
-            if let Some(node) = self.store.nodes.get_mut(key) {
-                node.candidate = node.initial.take();
+            if let Some(node) = self.store.nodes.get(key) {
+                let transaction = self.store.owners.get(node.owner.0).unwrap().registration;
+                let node = self.store.node_mut(key);
+                let mut source = node.initial.take().expect("initial source");
+                source.transactions.extend(transaction);
+                node.next_version = source.version;
+                node.candidate = Some(source);
             }
         }
+    }
+
+    fn promote_inputs(&mut self) {
+        self.seed_sources();
         let inputs: BTreeMap<_, _> = std::mem::take(&mut self.inputs).into_iter().collect();
         for (key, command) in inputs {
             if let Some(node) = self.store.nodes.get_mut(key) {
@@ -743,9 +1228,22 @@ impl<P> Runtime<P> {
                     let Command::Set(value) = command else {
                         unreachable!("source refresh is a no-op")
                     };
+                    let outcome = Outcome::Answer(Answer::Value(value));
+                    if node.candidate.is_none()
+                        && node
+                            .committed
+                            .as_ref()
+                            .is_some_and(|snapshot| outcome.same(&snapshot.outcome, node.compare))
+                    {
+                        continue;
+                    }
+                    let mut transactions = vec![self.transaction];
+                    if let Some(candidate) = &node.candidate {
+                        transactions.extend(&candidate.transactions);
+                    }
                     if self
                         .store
-                        .stage(key, Outcome::Answer(Answer::Value(value)), Vec::new())
+                        .stage(key, outcome, Vec::new(), transactions, true)
                     {
                         self.store.invalidate_subscribers(key);
                     }
@@ -774,83 +1272,308 @@ impl<P> Runtime<P> {
 
     fn flush_tick(&mut self, sink: &mut impl FrameSink<P>) -> Result<(), FlushError> {
         let ready = self.mailbox.drain();
+        self.transaction = self.store.new_transaction();
         self.promote_inputs();
         self.drain_dirty().map_err(|_| FlushError::Poisoned)?;
         for id in ready {
             let Some(answer) = self.poll_flight(id).and_then(Self::poll_answer) else {
                 continue;
             };
-            let reads = self
+            let snapshot = self
                 .store
                 .node(id.node)
                 .current()
-                .expect("live flight snapshot")
-                .reads
-                .clone();
-            if self.store.stage(id.node, Outcome::Answer(answer), reads) {
+                .expect("live flight snapshot");
+            let reads = snapshot.reads.clone();
+            let mut transactions = snapshot.transactions.clone();
+            let proposal = snapshot.proposal;
+            if transactions.is_empty() {
+                transactions.push(self.store.new_transaction());
+            }
+            if self.store.stage(
+                id.node,
+                Outcome::Answer(answer),
+                reads,
+                transactions,
+                proposal,
+            ) {
                 self.store.invalidate_subscribers(id.node);
                 self.drain_dirty().map_err(|_| FlushError::Poisoned)?;
             }
         }
 
-        let mut ops = Vec::new();
-        for &owner in &self.store.attach {
-            if self.store.owners.get(owner.0).is_some() {
-                ops.push(FrameOp::Attach {
-                    owner,
-                    parent: None,
-                    before: None,
-                });
+        let mut projection_holds = HashSet::new();
+        loop {
+            let (groups, ready) = self.transaction_groups();
+            let Some(transaction) = ready.into_iter().find(|id| !projection_holds.contains(id))
+            else {
+                return Ok(());
+            };
+            if self.publish_group(sink, &groups, transaction)? {
+                projection_holds.clear();
+                self.drain_dirty().map_err(|_| FlushError::Poisoned)?;
+            } else {
+                projection_holds.insert(transaction);
             }
         }
-        let mut staged = Vec::new();
-        let mut effects = Vec::new();
+    }
+
+    fn transaction_groups(&self) -> (TransactionGroups, Vec<Transaction>) {
+        let mut groups = TransactionGroups::default();
+        let mut candidates = Vec::new();
+        let mut ids = BTreeSet::new();
         for key in self.store.nodes.keys() {
             let node = self.store.node(key);
-            let Some(candidate) = &node.candidate else {
-                continue;
-            };
-            let Outcome::Answer(answer) = &candidate.outcome else {
-                continue;
-            };
-            staged.push(key);
-            if node.changed() {
-                match (&node.role, answer) {
-                    (Role::Render(apply), Answer::Value(value)) => {
-                        let owner = node.owner;
-                        let apply = Rc::clone(apply);
-                        let value = Rc::clone(value);
-                        ops.push(FrameOp::Patch(owner, apply(value)));
+            if let Some(candidate) = &node.candidate {
+                ids.extend(candidate.transactions.iter().copied());
+                let reader = matches!(node.role, Role::Render(_) | Role::Switch(_));
+                if reader || candidate.proposal {
+                    let replacement = self.store.replacing(node.owner);
+                    if replacement.is_none() || !reader {
+                        groups.join(&candidate.transactions);
                     }
-                    (Role::Render(_), Answer::Failed(_)) => return Err(FlushError::Poisoned),
-                    (Role::Effect(_), Answer::Value(value)) => {
-                        effects.push((key, Rc::clone(value)))
-                    }
-                    _ => {}
+                    candidates.push((reader, candidate, replacement));
                 }
             }
         }
-        for &owner in &self.store.attach {
-            if self.store.owners.get(owner.0).is_some() {
-                ops.push(FrameOp::SetVisible(owner, true));
+        ids.extend(
+            self.store
+                .attach
+                .iter()
+                .filter_map(|owner| self.store.owners.get(owner.0)?.registration),
+        );
+
+        for &(reader, candidate, replacement) in &candidates {
+            if let (true, Some(replacement)) = (reader, replacement) {
+                groups.join(&Self::reader_transactions(&groups, candidate, replacement));
+            }
+        }
+        for (reader, candidate, replacement) in candidates {
+            if !reader {
+                continue;
+            }
+            let Some(wait) = candidate.outcome.wait() else {
+                continue;
+            };
+            if let Some(replacement) = replacement {
+                let wait_is_retiring = candidate.reads.iter().any(|dep| {
+                    self.store
+                        .nodes
+                        .get(dep.source)
+                        .and_then(|node| node.candidate.as_ref())
+                        .is_some_and(|origin| {
+                            origin.outcome.wait() == Some(wait)
+                                && Self::reader_transactions(&groups, origin, replacement)
+                                    .is_empty()
+                        })
+                });
+                if !wait_is_retiring {
+                    groups.hold(&Self::reader_transactions(&groups, candidate, replacement));
+                }
+            } else {
+                groups.hold(&candidate.transactions);
+            }
+        }
+        let ready = ids
+            .into_iter()
+            .filter(|&id| groups.representative(id) == id && !groups.held.contains(&id))
+            .collect();
+        (groups, ready)
+    }
+
+    fn reader_transactions(
+        groups: &TransactionGroups,
+        candidate: &Snapshot,
+        replacement: &Snapshot,
+    ) -> Vec<Transaction> {
+        candidate
+            .transactions
+            .iter()
+            .copied()
+            .filter(|&id| {
+                !replacement
+                    .transactions
+                    .iter()
+                    .any(|&retiring| groups.representative(id) == groups.representative(retiring))
+            })
+            .collect()
+    }
+
+    fn publish_group(
+        &mut self,
+        sink: &mut impl FrameSink<P>,
+        groups: &TransactionGroups,
+        transaction: Transaction,
+    ) -> Result<bool, FlushError> {
+        let keys: Vec<_> = self.store.nodes.keys().collect();
+        let mut switches = Vec::new();
+        let mut retiring = HashSet::new();
+        for &key in &keys {
+            let node = self.store.node(key);
+            if let (Role::Switch(switch), Some(snapshot)) = (&node.role, &node.candidate) {
+                if switch.candidate.is_some() && groups.accepts(transaction, &snapshot.transactions)
+                {
+                    retiring.extend(switch.active);
+                    switches.push((key, switch.active));
+                }
+            }
+        }
+        switches.retain(|(key, _)| !self.store.owned_by(self.store.node(*key).owner, &retiring));
+        let mut projection = FrameReads {
+            id: self.id,
+            store: &self.store,
+            groups,
+            transaction,
+            retiring: &retiring,
+            checked: HashSet::new(),
+            running: HashSet::new(),
+            values: BTreeMap::new(),
+        };
+        for &key in &keys {
+            let node = self.store.node(key);
+            if matches!(node.role, Role::Render(_) | Role::Effect(_)) {
+                projection.resolve(key).map_err(|_| FlushError::Poisoned)?;
+            }
+        }
+        if projection.values.iter().any(|(&key, snapshot)| {
+            matches!(self.store.node(key).role, Role::Render(_))
+                && snapshot.outcome.wait().is_some()
+        }) {
+            return Ok(false);
+        }
+        let mut projected = projection.values;
+        projected.retain(|_, snapshot| matches!(snapshot.outcome, Outcome::Answer(_)));
+        for snapshot in projected.values() {
+            for dep in &snapshot.reads {
+                if let Some(source) = self.store.nodes.get_mut(dep.source) {
+                    source.subscribers.reserve(1);
+                }
             }
         }
 
-        let mut retired = Vec::with_capacity(staged.len());
+        let attached: Vec<_> = self
+            .store
+            .attach
+            .iter()
+            .copied()
+            .filter(|&owner| {
+                self.store
+                    .owners
+                    .get(owner.0)
+                    .and_then(|state| state.registration)
+                    .is_some_and(|id| groups.representative(id) == transaction)
+                    && !self.store.owned_by(owner, &retiring)
+            })
+            .collect();
+        let mut ops = Vec::new();
+        for &owner in &attached {
+            let parent = self
+                .store
+                .owners
+                .get(owner.0)
+                .expect("registered owner")
+                .parent;
+            let siblings = parent.map_or(self.store.roots.as_slice(), |parent| {
+                self.store
+                    .owners
+                    .get(parent.0)
+                    .expect("live parent")
+                    .children
+                    .as_slice()
+            });
+            let before = siblings
+                .iter()
+                .copied()
+                .skip_while(|&sibling| sibling != owner)
+                .skip(1)
+                .find(|&sibling| {
+                    self.store
+                        .owners
+                        .get(sibling.0)
+                        .is_some_and(|state| state.registration.is_none())
+                        && !self.store.owned_by(sibling, &retiring)
+                });
+            ops.push(FrameOp::Attach {
+                owner,
+                parent,
+                before,
+            });
+        }
+
+        let mut staged = Vec::new();
+        let mut effects = Vec::new();
+        for &key in &keys {
+            let node = self.store.node(key);
+            if self.store.owned_by(node.owner, &retiring) {
+                continue;
+            }
+            let candidate = node
+                .candidate
+                .as_ref()
+                .filter(|candidate| groups.accepts(transaction, &candidate.transactions));
+            let Some(snapshot) = projected.get(&key).or(candidate) else {
+                continue;
+            };
+            let Outcome::Answer(answer) = &snapshot.outcome else {
+                continue;
+            };
+            if candidate.is_some() && !projected.contains_key(&key) {
+                staged.push(key);
+            }
+            if node
+                .committed
+                .as_ref()
+                .is_some_and(|committed| committed.outcome.same(&snapshot.outcome, node.compare))
+            {
+                continue;
+            }
+            match (&node.role, answer) {
+                (Role::Render(apply), Answer::Value(value)) => {
+                    ops.push(FrameOp::Patch(node.owner, apply(Rc::clone(value))));
+                }
+                (Role::Render(_) | Role::Switch(_), Answer::Failed(_)) => {
+                    return Err(FlushError::Poisoned);
+                }
+                (Role::Effect(_), Answer::Value(value)) => effects.push((key, Rc::clone(value))),
+                _ => {}
+            }
+        }
+
+        for &owner in &attached {
+            ops.push(FrameOp::SetVisible(owner, true));
+        }
+        let mut removed = Vec::new();
+        for (_, active) in &switches {
+            if let Some(owner) = active {
+                self.store.attached_descendants(*owner, &mut removed);
+            }
+        }
+        ops.extend(removed.into_iter().map(FrameOp::Remove));
+        let mut replaced = Vec::with_capacity(staged.len() + projected.len());
+        let mut resume = Vec::with_capacity(staged.len());
         if !ops.is_empty() {
             let sequence = self
                 .sequence
                 .checked_add(1)
                 .expect("frame sequence exhausted");
-            sink.publish(Frame { sequence, ops })
-                .map_err(FlushError::Publish)?;
+            if let Err(error) = sink.publish(Frame { sequence, ops }) {
+                self.discard_unpublished();
+                return Err(FlushError::Publish(error));
+            }
             self.sequence = sequence;
         }
 
-        self.store.attach.clear();
-        let mut resume = Vec::new();
+        for owner in attached {
+            self.store.owner_mut(owner).registration = None;
+        }
+        self.store.attach.retain(|owner| {
+            self.store
+                .owners
+                .get(owner.0)
+                .is_some_and(|owner| owner.registration.is_some())
+        });
         for key in staged {
-            retired.push(self.store.commit(key));
+            replaced.push(self.store.commit(key));
             if let Some(id) = self
                 .store
                 .node_mut(key)
@@ -861,7 +1584,28 @@ impl<P> Runtime<P> {
                 resume.push(id);
             }
         }
-        drop(retired);
+        for (key, snapshot) in projected {
+            replaced.push(self.store.commit_frame(key, snapshot));
+        }
+        for &key in &keys {
+            if let Some(candidate) = &mut self.store.node_mut(key).candidate {
+                candidate
+                    .transactions
+                    .retain(|&id| groups.representative(id) != transaction);
+            }
+        }
+        let mut retired = Vec::new();
+        for (key, previous) in switches {
+            let Role::Switch(switch) = &mut self.store.node_mut(key).role else {
+                unreachable!()
+            };
+            switch.active = switch.candidate.take().map(|(owner, _)| owner);
+            if let Some(owner) = previous {
+                self.store.remove_tree(owner, &mut retired);
+            }
+        }
+        drop(replaced);
+        clean(retired);
         for id in resume {
             self.mailbox.request_tick(Some(id));
         }
@@ -874,7 +1618,22 @@ impl<P> Runtime<P> {
             self.store.node_mut(key).role = Role::Effect(Some(callback));
             result.map_err(|_| FlushError::Poisoned)?;
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn discard_unpublished(&mut self) {
+        let mut retired = Vec::new();
+        for owner in std::mem::take(&mut self.store.attach) {
+            self.store.remove_tree(owner, &mut retired);
+        }
+        let keys: Vec<_> = self.store.nodes.keys().collect();
+        for key in keys {
+            if let Role::Switch(switch) = &mut self.store.node_mut(key).role {
+                switch.candidate = None;
+            }
+            self.store.discard_candidate(key);
+        }
+        clean(retired);
     }
 }
 
@@ -919,18 +1678,7 @@ impl<P> Drive<P> for Runtime<P> {
         }
         self.guarded(|runtime| {
             let owner = runtime.store.create_root();
-            let mut reg = Registration {
-                store: std::mem::replace(&mut runtime.store, Store::new(runtime.id)),
-                owner,
-            };
-            let result = panic::catch_unwind(AssertUnwindSafe(|| build(&mut reg)));
-            runtime.store = reg.store;
-            if let Err(payload) = result {
-                let mut retired = Vec::new();
-                runtime.store.remove_tree(owner, &mut retired);
-                let _ = panic::catch_unwind(AssertUnwindSafe(|| clean(retired)));
-                panic::resume_unwind(payload);
-            }
+            runtime.build_owner(owner, build);
             runtime.request_tick();
             Ok(owner)
         })
@@ -945,7 +1693,16 @@ impl<P> Drive<P> for Runtime<P> {
             let mut retired = Vec::new();
             runtime.store.remove_tree(owner, &mut retired);
             clean(retired);
-            if !runtime.store.dirty.is_empty() {
+            if !runtime.store.dirty.is_empty()
+                || runtime.store.nodes.keys().any(|key| {
+                    runtime
+                        .store
+                        .node(key)
+                        .candidate
+                        .as_ref()
+                        .is_some_and(|snapshot| !snapshot.transactions.is_empty())
+                })
+            {
                 runtime.request_tick();
             }
         });

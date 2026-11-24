@@ -193,6 +193,12 @@ pub trait Register<P>: Sized {
     );
 
     fn on_cleanup(&mut self, cleanup: impl FnOnce() + 'static);
+
+    fn switch<K: PartialEq + 'static>(
+        &mut self,
+        key: impl Fn(&mut Cx<'_>) -> Read<K> + 'static,
+        build: impl Fn(&mut Self, Rc<K>) + 'static,
+    );
 }
 
 pub trait Drive<P> {
