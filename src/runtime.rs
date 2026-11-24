@@ -15,6 +15,9 @@ use crate::{
     *,
 };
 
+mod boundary;
+use boundary::{Boundary, BoundaryPlan, PublishGroup};
+
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 type Compute = Rc<dyn Fn(&mut Cx<'_>) -> Read<Computed>>;
@@ -153,6 +156,13 @@ enum Role<P> {
     Render(Render<P>),
     Effect(Option<ApplyEffect>),
     Switch(Switch<P>),
+    Loading,
+}
+
+impl<P> Role<P> {
+    fn is_render_reader(&self) -> bool {
+        matches!(self, Self::Render(_) | Self::Switch(_) | Self::Loading)
+    }
 }
 
 struct Switch<P> {
@@ -183,6 +193,21 @@ struct Node<P> {
     height: u32,
     queued: Option<u64>,
     running: bool,
+    applied: Option<Value>,
+    effect_error: Option<EffectError>,
+}
+
+struct EffectError {
+    failure: Failure,
+    question: u64,
+    version: u64,
+    transaction: Option<Transaction>,
+}
+
+impl EffectError {
+    fn matches(&self, snapshot: &Snapshot) -> bool {
+        (self.question, self.version) == (snapshot.question, snapshot.version)
+    }
 }
 
 impl<P> Node<P> {
@@ -210,11 +235,15 @@ struct OwnerState {
     resources: Vec<Resource>,
     registration: Option<Transaction>,
     branch: Option<Key>,
+    attached: bool,
+    visible: bool,
+    ordinal: u64,
 }
 
 enum Retired<P> {
     Node(Box<Node<P>>),
     Cleanup(Box<dyn FnOnce()>),
+    Boundary(Boundary<P>),
 }
 
 struct Store<P> {
@@ -226,6 +255,8 @@ struct Store<P> {
     dirty: BinaryHeap<Reverse<(u32, u64, Key)>>,
     next_enqueue: u64,
     next_transaction: Transaction,
+    next_owner: u64,
+    boundaries: BTreeMap<Key, Boundary<P>>,
 }
 
 impl<P> Store<P> {
@@ -239,6 +270,8 @@ impl<P> Store<P> {
             dirty: BinaryHeap::new(),
             next_enqueue: 0,
             next_transaction: 0,
+            next_owner: 0,
+            boundaries: BTreeMap::new(),
         }
     }
 
@@ -265,12 +298,19 @@ impl<P> Store<P> {
         transaction: Transaction,
         branch: Option<Key>,
     ) -> Owner {
+        self.next_owner = self
+            .next_owner
+            .checked_add(1)
+            .expect("owner order exhausted");
         let key = self.owners.insert(OwnerState {
             parent,
             children: Vec::new(),
             resources: Vec::new(),
             registration: Some(transaction),
             branch,
+            attached: false,
+            visible: true,
+            ordinal: self.next_owner,
         });
         let owner = Owner(key, PhantomData);
         if let Some(parent) = parent {
@@ -310,9 +350,48 @@ impl<P> Store<P> {
         }
     }
 
+    fn managed(&self, mut owner: Owner) -> bool {
+        while let Some(state) = self.owners.get(owner.0) {
+            if self.boundaries.contains_key(&owner.0) {
+                return true;
+            }
+            let Some(parent) = state.parent else {
+                break;
+            };
+            owner = parent;
+        }
+        false
+    }
+
+    fn visible(&self, mut owner: Owner) -> bool {
+        while let Some(state) = self.owners.get(owner.0) {
+            if !state.attached || !state.visible {
+                return false;
+            }
+            let Some(parent) = state.parent else {
+                return true;
+            };
+            owner = parent;
+        }
+        false
+    }
+
+    fn can_join_frame(&self, mut owner: Owner) -> bool {
+        while let Some(state) = self.owners.get(owner.0) {
+            if !state.visible && state.registration.is_none() {
+                return false;
+            }
+            let Some(parent) = state.parent else {
+                return true;
+            };
+            owner = parent;
+        }
+        false
+    }
+
     fn attached_descendants(&self, owner: Owner, removal: &mut Vec<Owner>) {
         if let Some(state) = self.owners.get(owner.0) {
-            if state.registration.is_none() {
+            if state.attached {
                 for &child in &state.children {
                     self.attached_descendants(child, removal);
                 }
@@ -497,7 +576,10 @@ impl<P> Store<P> {
                 owners.push((owner, state));
             }
         }
-        for (_, state) in owners.into_iter().rev() {
+        for (owner, state) in owners.into_iter().rev() {
+            if let Some(boundary) = self.boundaries.remove(&owner.0) {
+                retired.push(Retired::Boundary(boundary));
+            }
             for resource in state.resources.into_iter().rev() {
                 match resource {
                     Resource::Node(key) => {
@@ -539,6 +621,30 @@ struct FrameReads<'a, P> {
 }
 
 impl<P> FrameReads<'_, P> {
+    fn includes(&self, owner: Owner) -> bool {
+        self.store.owners.get(owner.0).is_some_and(|state| {
+            state
+                .registration
+                .is_none_or(|id| self.groups.representative(id) == self.transaction)
+                && !self.store.owned_by(owner, self.retiring)
+        })
+    }
+
+    fn reader_snapshot(&self, key: Key) -> Option<&Snapshot> {
+        let node = self.store.node(key);
+        self.values
+            .get(&key)
+            .or_else(|| {
+                node.candidate.as_ref().filter(|snapshot| {
+                    snapshot.transactions.is_empty()
+                        || self
+                            .groups
+                            .accepts(self.transaction, &snapshot.transactions)
+                })
+            })
+            .or(node.committed.as_ref())
+    }
+
     fn snapshot(&self, key: Key) -> Option<&Snapshot> {
         let node = self.store.nodes.get(key)?;
         self.values
@@ -680,6 +786,7 @@ fn clean<P>(retired: Vec<Retired<P>>) {
         let result = panic::catch_unwind(AssertUnwindSafe(move || match resource {
             Retired::Node(node) => drop(node),
             Retired::Cleanup(cleanup) => cleanup(),
+            Retired::Boundary(boundary) => drop(boundary),
         }));
         if let Err(payload) = result {
             if failure.is_none() {
@@ -704,10 +811,22 @@ impl<P> Registration<P> {
         compute: Option<Compute>,
         initial: Option<T>,
     ) -> ReadRef<T> {
+        self.register_with_compare(role, compute, initial, |left, right| {
+            left.downcast_ref::<T>() == right.downcast_ref::<T>()
+        })
+    }
+
+    fn register_with_compare<T: 'static>(
+        &mut self,
+        role: Role<P>,
+        compute: Option<Compute>,
+        initial: Option<T>,
+        compare: Compare,
+    ) -> ReadRef<T> {
         let key = self.store.nodes.insert(Node {
             owner: self.owner,
             ty: TypeId::of::<T>(),
-            compare: |left, right| left.downcast_ref::<T>() == right.downcast_ref::<T>(),
+            compare,
             compute,
             role,
             initial: initial.map(|value| Snapshot {
@@ -728,6 +847,8 @@ impl<P> Registration<P> {
             height: 0,
             queued: None,
             running: false,
+            applied: None,
+            effect_error: None,
         });
         self.store
             .owner_mut(self.owner)
@@ -839,12 +960,35 @@ impl<P> Register<P> for Registration<P> {
         );
         self.owner = parent;
     }
+
+    fn loading(
+        &mut self,
+        on: impl Fn(&mut Cx<'_>) -> Read<()> + 'static,
+        content: impl Fn(&mut Self) + 'static,
+        fallback: impl Fn(&mut Self) + 'static,
+    ) {
+        self.register_loading(on, content, fallback);
+    }
+
+    fn errored(
+        &mut self,
+        content: impl Fn(&mut Self) + 'static,
+        fallback: impl Fn(&mut Self, ReadRef<Failure>) + 'static,
+    ) {
+        self.register_errored(content, fallback);
+    }
+
+    fn reveal(&mut self, order: RevealOrder, collapse_tail: bool, build: impl FnOnce(&mut Self)) {
+        self.register_reveal(order, collapse_tail, build);
+    }
 }
 
 pub struct Runtime<P> {
     id: u64,
     store: Store<P>,
     inputs: Vec<(Key, Command)>,
+    effect_errors: Vec<(Key, EffectError)>,
+    layout: Option<Transaction>,
     mailbox: Arc<Mailbox>,
     next_flight: u64,
     transaction: Transaction,
@@ -873,6 +1017,8 @@ impl<P> Runtime<P> {
             id,
             store: Store::new(id),
             inputs: Vec::new(),
+            effect_errors: Vec::new(),
+            layout: None,
             mailbox: Mailbox::new(wake_host),
             next_flight: 0,
             transaction: 0,
@@ -1272,6 +1418,12 @@ impl<P> Runtime<P> {
 
     fn flush_tick(&mut self, sink: &mut impl FrameSink<P>) -> Result<(), FlushError> {
         let ready = self.mailbox.drain();
+        for (key, mut error) in std::mem::take(&mut self.effect_errors) {
+            if self.store.nodes.get(key).is_some() {
+                error.transaction = Some(self.store.new_transaction());
+                self.store.node_mut(key).effect_error = Some(error);
+            }
+        }
         self.transaction = self.store.new_transaction();
         self.promote_inputs();
         self.drain_dirty().map_err(|_| FlushError::Poisoned)?;
@@ -1309,11 +1461,14 @@ impl<P> Runtime<P> {
             else {
                 return Ok(());
             };
-            if self.publish_group(sink, &groups, transaction)? {
-                projection_holds.clear();
-                self.drain_dirty().map_err(|_| FlushError::Poisoned)?;
-            } else {
-                projection_holds.insert(transaction);
+            match self.publish_group(sink, &groups, transaction)? {
+                PublishGroup::Committed | PublishGroup::Staged => {
+                    projection_holds.clear();
+                    self.drain_dirty().map_err(|_| FlushError::Poisoned)?;
+                }
+                PublishGroup::Held => {
+                    projection_holds.insert(transaction);
+                }
             }
         }
     }
@@ -1324,15 +1479,21 @@ impl<P> Runtime<P> {
         let mut ids = BTreeSet::new();
         for key in self.store.nodes.keys() {
             let node = self.store.node(key);
+            ids.extend(
+                node.effect_error
+                    .as_ref()
+                    .and_then(|error| error.transaction),
+            );
             if let Some(candidate) = &node.candidate {
                 ids.extend(candidate.transactions.iter().copied());
-                let reader = matches!(node.role, Role::Render(_) | Role::Switch(_));
+                let reader = node.role.is_render_reader();
                 if reader || candidate.proposal {
                     let replacement = self.store.replacing(node.owner);
-                    if replacement.is_none() || !reader {
+                    let joins = reader && self.store.can_join_frame(node.owner);
+                    if candidate.proposal || (joins && replacement.is_none()) {
                         groups.join(&candidate.transactions);
                     }
-                    candidates.push((reader, candidate, replacement));
+                    candidates.push((reader, joins, candidate, replacement, node.owner));
                 }
             }
         }
@@ -1342,14 +1503,15 @@ impl<P> Runtime<P> {
                 .iter()
                 .filter_map(|owner| self.store.owners.get(owner.0)?.registration),
         );
+        ids.extend(self.layout);
 
-        for &(reader, candidate, replacement) in &candidates {
-            if let (true, Some(replacement)) = (reader, replacement) {
+        for &(_, joins, candidate, replacement, _) in &candidates {
+            if let (true, Some(replacement)) = (joins, replacement) {
                 groups.join(&Self::reader_transactions(&groups, candidate, replacement));
             }
         }
-        for (reader, candidate, replacement) in candidates {
-            if !reader {
+        for (reader, _, candidate, replacement, owner) in candidates {
+            if !reader || self.store.managed(owner) {
                 continue;
             }
             let Some(wait) = candidate.outcome.wait() else {
@@ -1404,7 +1566,7 @@ impl<P> Runtime<P> {
         sink: &mut impl FrameSink<P>,
         groups: &TransactionGroups,
         transaction: Transaction,
-    ) -> Result<bool, FlushError> {
+    ) -> Result<PublishGroup, FlushError> {
         let keys: Vec<_> = self.store.nodes.keys().collect();
         let mut switches = Vec::new();
         let mut retiring = HashSet::new();
@@ -1431,18 +1593,53 @@ impl<P> Runtime<P> {
         };
         for &key in &keys {
             let node = self.store.node(key);
-            if matches!(node.role, Role::Render(_) | Role::Effect(_)) {
+            if matches!(node.role, Role::Render(_) | Role::Effect(_) | Role::Loading)
+                && projection.includes(node.owner)
+            {
                 projection.resolve(key).map_err(|_| FlushError::Poisoned)?;
             }
         }
-        if projection.values.iter().any(|(&key, snapshot)| {
-            matches!(self.store.node(key).role, Role::Render(_))
-                && snapshot.outcome.wait().is_some()
-        }) {
-            return Ok(false);
+        let boundaries = BoundaryPlan::prepare(&projection);
+        if boundaries.needs_staging() {
+            boundaries.stage(self, transaction);
+            return Ok(PublishGroup::Staged);
+        }
+        if boundaries.held() {
+            return Ok(PublishGroup::Held);
+        }
+        if boundaries.failed() {
+            return Err(FlushError::Poisoned);
+        }
+        let boundary_removals = boundaries.removals();
+        let mut visible = HashSet::new();
+        let mut included = Vec::new();
+        let mut traversal: Vec<_> = self
+            .store
+            .roots
+            .iter()
+            .rev()
+            .copied()
+            .map(|owner| (owner, true))
+            .collect();
+        while let Some((owner, parent_visible)) = traversal.pop() {
+            if !projection.includes(owner) || boundary_removals.contains(&owner) {
+                continue;
+            }
+            let state = self.store.owners.get(owner.0).expect("included owner");
+            let showing = parent_visible && boundaries.local_visibility(owner, state);
+            if showing {
+                visible.insert(owner);
+            }
+            included.push(owner);
+            traversal.extend(state.children.iter().rev().map(|&child| (child, showing)));
         }
         let mut projected = projection.values;
-        projected.retain(|_, snapshot| matches!(snapshot.outcome, Outcome::Answer(_)));
+        retiring.extend(&boundary_removals);
+        switches.retain(|(key, _)| !self.store.owned_by(self.store.node(*key).owner, &retiring));
+        projected.retain(|key, snapshot| {
+            !self.store.owned_by(self.store.node(*key).owner, &retiring)
+                && matches!(snapshot.outcome, Outcome::Answer(_))
+        });
         for snapshot in projected.values() {
             for dep in &snapshot.reads {
                 if let Some(source) = self.store.nodes.get_mut(dep.source) {
@@ -1451,18 +1648,17 @@ impl<P> Runtime<P> {
             }
         }
 
-        let attached: Vec<_> = self
-            .store
-            .attach
+        let attached: Vec<_> = included
             .iter()
             .copied()
             .filter(|&owner| {
-                self.store
-                    .owners
-                    .get(owner.0)
-                    .and_then(|state| state.registration)
-                    .is_some_and(|id| groups.representative(id) == transaction)
-                    && !self.store.owned_by(owner, &retiring)
+                visible.contains(&owner)
+                    && !self
+                        .store
+                        .owners
+                        .get(owner.0)
+                        .expect("included owner")
+                        .attached
             })
             .collect();
         let mut ops = Vec::new();
@@ -1490,7 +1686,7 @@ impl<P> Runtime<P> {
                     self.store
                         .owners
                         .get(sibling.0)
-                        .is_some_and(|state| state.registration.is_none())
+                        .is_some_and(|state| state.attached)
                         && !self.store.owned_by(sibling, &retiring)
                 });
             ops.push(FrameOp::Attach {
@@ -1511,7 +1707,12 @@ impl<P> Runtime<P> {
                 .candidate
                 .as_ref()
                 .filter(|candidate| groups.accepts(transaction, &candidate.transactions));
-            let Some(snapshot) = projected.get(&key).or(candidate) else {
+            let next = projected.get(&key).or(candidate);
+            let showing = visible.contains(&node.owner);
+            let exposed = showing && !self.store.visible(node.owner);
+            let Some(snapshot) =
+                next.or_else(|| exposed.then_some(node.committed.as_ref()).flatten())
+            else {
                 continue;
             };
             let Outcome::Answer(answer) = &snapshot.outcome else {
@@ -1520,21 +1721,26 @@ impl<P> Runtime<P> {
             if candidate.is_some() && !projected.contains_key(&key) {
                 staged.push(key);
             }
-            if node
-                .committed
-                .as_ref()
-                .is_some_and(|committed| committed.outcome.same(&snapshot.outcome, node.compare))
-            {
+            if !showing {
                 continue;
             }
             match (&node.role, answer) {
-                (Role::Render(apply), Answer::Value(value)) => {
+                (Role::Render(apply), Answer::Value(value))
+                    if exposed
+                        || node.committed.as_ref().is_none_or(|committed| {
+                            !committed.outcome.same(&snapshot.outcome, node.compare)
+                        }) =>
+                {
                     ops.push(FrameOp::Patch(node.owner, apply(Rc::clone(value))));
                 }
-                (Role::Render(_) | Role::Switch(_), Answer::Failed(_)) => {
-                    return Err(FlushError::Poisoned);
+                (Role::Effect(_), Answer::Value(value))
+                    if node
+                        .applied
+                        .as_ref()
+                        .is_none_or(|last| !(node.compare)(last, value)) =>
+                {
+                    effects.push((key, Rc::clone(value)));
                 }
-                (Role::Effect(_), Answer::Value(value)) => effects.push((key, Rc::clone(value))),
                 _ => {}
             }
         }
@@ -1542,11 +1748,21 @@ impl<P> Runtime<P> {
         for &owner in &attached {
             ops.push(FrameOp::SetVisible(owner, true));
         }
+        for &owner in &included {
+            let state = self.store.owners.get(owner.0).expect("included owner");
+            let showing = boundaries.local_visibility(owner, state);
+            if state.attached && state.visible != showing {
+                ops.push(FrameOp::SetVisible(owner, showing));
+            }
+        }
         let mut removed = Vec::new();
         for (_, active) in &switches {
             if let Some(owner) = active {
                 self.store.attached_descendants(*owner, &mut removed);
             }
+        }
+        for &owner in &boundary_removals {
+            self.store.attached_descendants(owner, &mut removed);
         }
         ops.extend(removed.into_iter().map(FrameOp::Remove));
         let mut replaced = Vec::with_capacity(staged.len() + projected.len());
@@ -1564,8 +1780,18 @@ impl<P> Runtime<P> {
         }
 
         for owner in attached {
+            self.store.owner_mut(owner).attached = true;
+        }
+        for owner in included {
             self.store.owner_mut(owner).registration = None;
         }
+        if self
+            .layout
+            .is_some_and(|id| groups.representative(id) == transaction)
+        {
+            self.layout = None;
+        }
+        boundaries.commit(&mut self.store);
         self.store.attach.retain(|owner| {
             self.store
                 .owners
@@ -1588,10 +1814,27 @@ impl<P> Runtime<P> {
             replaced.push(self.store.commit_frame(key, snapshot));
         }
         for &key in &keys {
-            if let Some(candidate) = &mut self.store.node_mut(key).candidate {
+            let node = self.store.node_mut(key);
+            if let Some(candidate) = &mut node.candidate {
                 candidate
                     .transactions
                     .retain(|&id| groups.representative(id) != transaction);
+            }
+            if let Some(error) = &mut node.effect_error {
+                if error
+                    .transaction
+                    .is_some_and(|id| groups.representative(id) == transaction)
+                {
+                    error.transaction = None;
+                }
+                if error.transaction.is_none()
+                    && node
+                        .committed
+                        .as_ref()
+                        .is_some_and(|snapshot| !error.matches(snapshot))
+                {
+                    node.effect_error = None;
+                }
             }
         }
         let mut retired = Vec::new();
@@ -1604,6 +1847,9 @@ impl<P> Runtime<P> {
                 self.store.remove_tree(owner, &mut retired);
             }
         }
+        for owner in boundary_removals {
+            self.store.remove_tree(owner, &mut retired);
+        }
         drop(replaced);
         clean(retired);
         for id in resume {
@@ -1614,11 +1860,27 @@ impl<P> Runtime<P> {
                 unreachable!()
             };
             let mut callback = apply.take().expect("registered effect");
-            let result = callback(&mut EffectCx { writes: self }, value);
-            self.store.node_mut(key).role = Role::Effect(Some(callback));
-            result.map_err(|_| FlushError::Poisoned)?;
+            let result = callback(&mut EffectCx { writes: self }, Rc::clone(&value));
+            let node = self.store.node_mut(key);
+            node.role = Role::Effect(Some(callback));
+            match result {
+                Ok(()) => node.applied = Some(value),
+                Err(failure) => {
+                    let snapshot = node.committed.as_ref().expect("applied effect snapshot");
+                    self.effect_errors.push((
+                        key,
+                        EffectError {
+                            failure,
+                            question: snapshot.question,
+                            version: snapshot.version,
+                            transaction: None,
+                        },
+                    ));
+                    self.request_tick();
+                }
+            }
         }
-        Ok(true)
+        Ok(PublishGroup::Committed)
     }
 
     fn discard_unpublished(&mut self) {
@@ -1690,10 +1952,15 @@ impl<P> Drive<P> for Runtime<P> {
             return Err(HandleError::Disposed);
         }
         self.guarded(|runtime| {
+            let layout_changed = runtime.store.managed(owner);
             let mut retired = Vec::new();
             runtime.store.remove_tree(owner, &mut retired);
             clean(retired);
-            if !runtime.store.dirty.is_empty()
+            if layout_changed {
+                runtime.layout = Some(runtime.store.new_transaction());
+            }
+            if layout_changed
+                || !runtime.store.dirty.is_empty()
                 || runtime.store.nodes.keys().any(|key| {
                     runtime
                         .store

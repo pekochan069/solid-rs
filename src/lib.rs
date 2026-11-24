@@ -148,6 +148,13 @@ pub enum FrameOp<P> {
     Remove(Owner),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevealOrder {
+    Sequential,
+    Together,
+    Natural,
+}
+
 #[derive(Debug)]
 pub struct Frame<P> {
     pub sequence: u64,
@@ -199,6 +206,21 @@ pub trait Register<P>: Sized {
         key: impl Fn(&mut Cx<'_>) -> Read<K> + 'static,
         build: impl Fn(&mut Self, Rc<K>) + 'static,
     );
+
+    fn loading(
+        &mut self,
+        on: impl Fn(&mut Cx<'_>) -> Read<()> + 'static,
+        content: impl Fn(&mut Self) + 'static,
+        fallback: impl Fn(&mut Self) + 'static,
+    );
+
+    fn errored(
+        &mut self,
+        content: impl Fn(&mut Self) + 'static,
+        fallback: impl Fn(&mut Self, ReadRef<Failure>) + 'static,
+    );
+
+    fn reveal(&mut self, order: RevealOrder, collapse_tail: bool, build: impl FnOnce(&mut Self));
 }
 
 pub trait Drive<P> {
